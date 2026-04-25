@@ -449,8 +449,16 @@ def blocks_to_readable_pattern(block_summaries: list[dict]) -> str:
         ys = sorted(xs)
         return int(ys[len(ys) // 2])
 
+    def _round_to_nearest_30s(seconds: int) -> int:
+        # Round to nearest 30 seconds (whole/half minutes).
+        if seconds <= 0:
+            return 0
+        return int(round(seconds / 30.0) * 30)
+
     run_dur = _median_int(run_durs)
     walk_dur = _median_int(walk_durs) if walk_durs else 0
+    run_dur = _round_to_nearest_30s(run_dur)
+    walk_dur = _round_to_nearest_30s(walk_dur)
     # Estimate repetitions by counting run blocks (more robust than exact matching).
     reps = min(len(run_durs), len(walk_durs)) if walk_durs else len(run_durs)
 
