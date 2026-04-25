@@ -2,7 +2,6 @@ import json
 import os
 import smtplib
 import ssl
-import sys
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -187,6 +186,8 @@ def should_send_now(now_utc: datetime) -> bool:
     Gate sending so GitHub Actions can run multiple UTC times,
     but we only send at Sunday 22:00 in Europe/Amsterdam.
     """
+    if (_env("FORCE_SEND") or "").lower() in {"1", "true", "yes", "y"}:
+        return True
     if ZoneInfo is None:
         return True
     tz = ZoneInfo("Europe/Amsterdam")
@@ -278,11 +279,8 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(f"OpenAI request failed: {e}")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
 
     try:
         return str(data["choices"][0]["message"]["content"]).strip()
@@ -359,7 +357,10 @@ def main() -> int:
     week_summary = build_week_summary(runs)
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
-    subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()})"
+    subject = (
+        f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–"
+        f"{(week_end_local.date() - timedelta(days=1)).isoformat()})"
+    )
     send_email(subject, body)
     print("Email sent.")
     return 0
@@ -367,4 +368,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
