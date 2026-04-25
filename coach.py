@@ -8,6 +8,9 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import html
 
 try:
     from zoneinfo import ZoneInfo  # py>=3.9
@@ -670,27 +673,128 @@ def fallback_email(week_summary: dict) -> str:
     return "\n".join(lines)
 
 
-def send_email(subject: str, body: str) -> None:
+def _render_html_email(subject: str, plain_text: str, week_summary: dict) -> str:
+    runs = week_summary.get("runs") or []
+    runs_detailed = week_summary.get("runs_detailed") or []
+
+    def esc(s: object) -> str:
+        return html.escape("" if s is None else str(s))
+
+    # Basic inline CSS (email-safe)
+    css = """
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif; color:#111; }
+    h2 { margin: 18px 0 8px; }
+    .meta { color:#555; font-size: 13px; margin-bottom: 12px; }
+    .card { border:1px solid #e5e5e5; border-radius:10px; padding:12px 14px; margin:12px 0; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { border-bottom:1px solid #eee; padding:8px 6px; text-align:left; font-size: 13px; vertical-align: top; }
+    th { background:#fafafa; font-weight:600; }
+    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; background:#f2f4f7; font-size:12px; color:#333; }
+    .muted { color:#666; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }
+    """
+
+    # Summary table
+    summary_rows = []
+    for r in runs:
+        summary_rows.append(
+            f"<tr>"
+            f"<td>{esc(r.get('date'))}</td>"
+            f"<td>{esc(r.get('distance_km'))} km</td>"
+            f"<td>{esc(r.get('moving_time'))}</td>"
+            f"<td>{esc(r.get('avg_pace'))}</td>"
+            f"<td>{esc(r.get('avg_hr') or '—')}</td>"
+            f"<td><span class='pill'>{esc(r.get('classification'))}</span></td>"
+            f"</tr>"
+        )
+    summary_table = (
+        "<div class='card'>"
+        "<h2>Overzicht (deze week)</h2>"
+        "<table>"
+        "<thead><tr><th>Datum</th><th>Afstand</th><th>Tijd</th><th>Tempo</th><th>HR</th><th>Type</th></tr></thead>"
+        f"<tbody>{''.join(summary_rows) if summary_rows else '<tr><td colspan=6>Geen runs gevonden.</td></tr>'}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+    # Block tables per run (first ~2 runs to keep email readable)
+    blocks_html = []
+    for rd in runs_detailed[:3]:
+        blocks = rd.get("blocks") or []
+        header = (
+            f"<div class='card'>"
+            f"<h2>Intervalblokken {esc(rd.get('date'))}</h2>"
+            f"<div class='meta'>{esc(rd.get('name'))} — {esc(rd.get('distance_km'))} km — patroon: "
+            f"<span class='pill'>{esc(rd.get('pattern_estimate'))}</span></div>"
+        )
+        if rd.get("streams_error"):
+            blocks_html.append(header + f"<div class='muted'>Streams niet beschikbaar: {esc(rd.get('streams_error'))}</div></div>")
+            continue
+
+        rows = []
+        for b in blocks[:18]:
+            dur = int(b.get("duration_s") or 0)
+            rows.append(
+                "<tr>"
+                f"<td><span class='pill'>{esc(b.get('kind'))}</span></td>"
+                f"<td class='mono'>{dur//60}:{dur%60:02d}</td>"
+                f"<td>{esc(fmt_pace(b.get('avg_pace_min_per_km')))}</td>"
+                f"<td>{esc(b.get('avg_hr') or '—')}</td>"
+                f"<td>{esc(b.get('hr_change') if b.get('hr_change') is not None else '—')}</td>"
+                f"<td>{esc(b.get('hr_drop_60s') if b.get('hr_drop_60s') is not None else '—')}</td>"
+                "</tr>"
+            )
+
+        blocks_html.append(
+            header
+            + "<table>"
+            + "<thead><tr><th>Blok</th><th>Duur</th><th>Gem. tempo</th><th>Gem. HR</th><th>HRΔ</th><th>HR↓60s</th></tr></thead>"
+            + f"<tbody>{''.join(rows) if rows else '<tr><td colspan=6>Geen blokken gevonden.</td></tr>'}</tbody>"
+            + "</table>"
+            + "</div>"
+        )
+
+    coach_text_html = (
+        "<div class='card'>"
+        "<h2>Coachbericht</h2>"
+        f"<div class='mono'>{esc(plain_text)}</div>"
+        "</div>"
+    )
+
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{esc(subject)}</title>"
+        f"<style>{css}</style></head><body>"
+        f"<div class='meta'>{esc(subject)}</div>"
+        f"{summary_table}"
+        f"{''.join(blocks_html)}"
+        f"{coach_text_html}"
+        "</body></html>"
+    )
+
+def send_email(subject: str, body: str, week_summary: dict) -> None:
     gmail_user = _env("GMAIL_USER")
     gmail_app_password = _env("GMAIL_APP_PASSWORD")
     mail_to = _env("MAIL_TO")
     if not gmail_user or not gmail_app_password or not mail_to:
         raise SystemExit("Missing GMAIL_USER / GMAIL_APP_PASSWORD / MAIL_TO env vars.")
 
-    msg = (
-        f"From: {gmail_user}\r\n"
-        f"To: {mail_to}\r\n"
-        f"Subject: {subject}\r\n"
-        "MIME-Version: 1.0\r\n"
-        "Content-Type: text/plain; charset=utf-8\r\n"
-        "\r\n"
-        f"{body}\r\n"
-    )
+    # Always send multipart (plain + html) so it looks nice but stays compatible.
+    msg = MIMEMultipart("alternative")
+    msg["From"] = gmail_user
+    msg["To"] = mail_to
+    msg["Subject"] = subject
+
+    plain_part = MIMEText(body, "plain", "utf-8")
+    html_body = _render_html_email(subject, body, week_summary)
+    html_part = MIMEText(html_body, "html", "utf-8")
+    msg.attach(plain_part)
+    msg.attach(html_part)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
         server.login(gmail_user, gmail_app_password)
-        server.sendmail(gmail_user, [mail_to], msg.encode("utf-8"))
+        server.sendmail(gmail_user, [mail_to], msg.as_string())
 
 
 def main() -> int:
@@ -708,7 +812,7 @@ def main() -> int:
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
     subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()})"
-    send_email(subject, body)
+    send_email(subject, body, week_summary)
     print("Email sent.")
     return 0
 
