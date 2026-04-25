@@ -1032,22 +1032,6 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
             blocks_html.append(header + f"<div class='muted'>Streams niet beschikbaar: {esc(rd.get('streams_error'))}</div></div>")
             continue
 
-        rows = []
-        for b in blocks[:18]:
-            if b.get("kind") == "pause":
-                continue
-            dur = int(b.get("duration_s") or 0)
-            rows.append(
-                "<tr>"
-                f"<td><span class='pill'>{esc(b.get('kind'))}</span></td>"
-                f"<td class='mono'>{dur//60}:{dur%60:02d}</td>"
-                f"<td>{esc(fmt_pace(b.get('avg_pace_min_per_km')))}</td>"
-                f"<td>{esc(b.get('avg_hr') or '—')}</td>"
-                f"<td>{esc(b.get('hr_change') if b.get('hr_change') is not None else '—')}</td>"
-                f"<td>{esc(b.get('hr_drop_60s') if b.get('hr_drop_60s') is not None else '—')}</td>"
-                "</tr>"
-            )
-
         timer_table = ""
         if timer_blocks:
             trows = []
@@ -1073,12 +1057,9 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
                 "</div>"
             )
 
+        # Hide the raw (Strava-segmented) blocks: in city running they are too noisy.
         blocks_html.append(
             header
-            + "<table>"
-            + "<thead><tr><th>Blok</th><th>Duur</th><th>Gem. tempo</th><th>Gem. HR</th><th>HRΔ</th><th>HR↓60s</th></tr></thead>"
-            + f"<tbody>{''.join(rows) if rows else '<tr><td colspan=6>Geen blokken gevonden.</td></tr>'}</tbody>"
-            + "</table>"
             + timer_table
             + "</div>"
         )
@@ -1280,7 +1261,7 @@ def _plot_series_png(series: dict, *, kind: str) -> Optional[bytes]:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except Exception:
-        return None
+        plt = None  # type: ignore
 
     x = series.get("minutes") or []
     if not x:
@@ -1308,21 +1289,78 @@ def _plot_series_png(series: dict, *, kind: str) -> Optional[bytes]:
             xs.append(float(xi))
             ys.append(float(yi))
 
-    fig, ax = plt.subplots(figsize=(7.2, 2.2), dpi=140)
-    ax.plot(xs, ys, linewidth=1.6, color=color)
-    ax.set_title(title, fontsize=10, loc="left")
-    ax.set_xlabel("min", fontsize=8)
-    ax.grid(True, alpha=0.18)
-    ax.tick_params(axis="both", labelsize=8)
+    if plt is not None:
+        fig, ax = plt.subplots(figsize=(7.2, 2.2), dpi=140)
+        ax.plot(xs, ys, linewidth=1.6, color=color)
+        ax.set_title(title, fontsize=10, loc="left")
+        ax.set_xlabel("min", fontsize=8)
+        ax.grid(True, alpha=0.18)
+        ax.tick_params(axis="both", labelsize=8)
 
-    # Pace chart: invert y so faster (lower) is higher up
-    if kind == "pace":
-        ax.invert_yaxis()
+        # Pace chart: invert y so faster (lower) is higher up
+        if kind == "pace":
+            ax.invert_yaxis()
+
+        buf = io.BytesIO()
+        fig.tight_layout()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        return buf.getvalue()
+
+    # Fallback: simple plot via Pillow (keeps charts working even if matplotlib fails).
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+
+    w, h = 1000, 320
+    pad_l, pad_r, pad_t, pad_b = 44, 18, 30, 34
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((pad_l, 8), title, fill=(20, 20, 20))
+
+    vals: list[float] = [v for v in ys if v == v]  # NaN check
+    if len(vals) < 2:
+        return None
+    y_min = min(vals)
+    y_max = max(vals)
+    if y_max - y_min < 1e-6:
+        y_max = y_min + 1.0
+
+    invert = kind == "pace"
+
+    def x_to_px(xv: float) -> int:
+        x0 = float(xs[0]) if xs else 0.0
+        x1 = float(xs[-1]) if xs else 1.0
+        if x1 - x0 < 1e-6:
+            x1 = x0 + 1.0
+        return int(pad_l + (w - pad_l - pad_r) * ((xv - x0) / (x1 - x0)))
+
+    def y_to_px(yv: float) -> int:
+        t = (yv - y_min) / (y_max - y_min)
+        if invert:
+            t = 1.0 - t
+        return int(pad_t + (h - pad_t - pad_b) * t)
+
+    for k in range(5):
+        yy = pad_t + int((h - pad_t - pad_b) * (k / 4))
+        draw.line([(pad_l, yy), (w - pad_r, yy)], fill=(235, 235, 235), width=1)
+    draw.line([(pad_l, pad_t), (pad_l, h - pad_b)], fill=(210, 210, 210), width=1)
+    draw.line([(pad_l, h - pad_b), (w - pad_r, h - pad_b)], fill=(210, 210, 210), width=1)
+
+    last = None
+    rgb = (37, 99, 235) if kind == "pace" else (220, 38, 38)
+    for xv, yv in zip(xs, ys):
+        if yv != yv:
+            last = None
+            continue
+        p = (x_to_px(float(xv)), y_to_px(float(yv)))
+        if last is not None:
+            draw.line([last, p], fill=rgb, width=3)
+        last = p
 
     buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png")
-    plt.close(fig)
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
