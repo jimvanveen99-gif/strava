@@ -1025,6 +1025,8 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
             if cid_hr:
                 imgs.append(f"<div><div class='muted'>Hartslag</div><img alt='Hartslag' style='max-width:100%; height:auto;' src='cid:{esc(cid_hr)}' /></div>")
             chart_html = "<div style='display:grid; gap:12px; grid-template-columns:1fr;'>" + "".join(imgs) + "</div>"
+        else:
+            chart_html = "<div class='muted' style='margin:8px 0'>Geen grafieken gegenereerd (ontbrekende streams of plotting dependency).</div>"
 
         header = (
             f"<div class='card'>"
@@ -1190,6 +1192,11 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
         # Some email clients hide inline images. We mark them inline but also give a filename so they show up as attachments.
         img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
         msg.attach(img)
+
+        # Also attach as a normal attachment so Apple Mail shows it reliably.
+        att = MIMEImage(data, _subtype="png")
+        att.add_header("Content-Disposition", "attachment", filename=f"{cid}.png")
+        msg.attach(att)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
