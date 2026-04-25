@@ -1013,8 +1013,11 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         chart_html = ""
         cid_pace = inline_cids.get(f"{rd.get('id')}:pace")
         cid_hr = inline_cids.get(f"{rd.get('id')}:hr")
-        if cid_pace or cid_hr:
+        cid_intervals = inline_cids.get(f"{rd.get('id')}:intervals")
+        if cid_pace or cid_hr or cid_intervals:
             imgs = []
+            if cid_intervals:
+                imgs.append(f"<div><div class='muted'>Run/Walk</div><img alt='Run/Walk' style='max-width:100%; height:auto;' src='cid:{esc(cid_intervals)}' /></div>")
             if cid_pace:
                 imgs.append(f"<div><div class='muted'>Tempo</div><img alt='Tempo' style='max-width:100%; height:auto;' src='cid:{esc(cid_pace)}' /></div>")
             if cid_hr:
@@ -1159,6 +1162,7 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
             continue
         pace_png = _plot_series_png(series, kind="pace")
         hr_png = _plot_series_png(series, kind="hr")
+        interval_png = _plot_intervals_png(rd.get("timer_blocks") or rd.get("blocks") or [], title="Run/Walk timeline")
         if pace_png:
             cid = f"run{rid}-pace"
             inline_cids[f"{rid}:pace"] = cid
@@ -1167,6 +1171,10 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
             cid = f"run{rid}-hr"
             inline_cids[f"{rid}:hr"] = cid
             images.append((cid, hr_png))
+        if interval_png:
+            cid = f"run{rid}-intervals"
+            inline_cids[f"{rid}:intervals"] = cid
+            images.append((cid, interval_png))
 
     html_body = _render_html_email(subject, body, week_summary, inline_cids)
     alt.attach(MIMEText(html_body, "html", "utf-8"))
@@ -1175,6 +1183,7 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
     for cid, data in images:
         img = MIMEImage(data, _subtype="png")
         img.add_header("Content-ID", f"<{cid}>")
+        # Some email clients hide inline images. We mark them inline but also give a filename so they show up as attachments.
         img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
         msg.attach(img)
 
@@ -1200,10 +1209,13 @@ def write_preview(subject: str, body: str, week_summary: dict, *, out_dir: str =
             continue
         pace_png = _plot_series_png(series, kind="pace")
         hr_png = _plot_series_png(series, kind="hr")
+        interval_png = _plot_intervals_png(rd.get("timer_blocks") or rd.get("blocks") or [], title="Run/Walk timeline")
         if pace_png:
             images.append((f"run{rid}-pace.png", pace_png))
         if hr_png:
             images.append((f"run{rid}-hr.png", hr_png))
+        if interval_png:
+            images.append((f"run{rid}-intervals.png", interval_png))
 
     for name, data in images:
         with open(os.path.join(out_dir, name), "wb") as f:
@@ -1358,6 +1370,74 @@ def _plot_series_png(series: dict, *, kind: str) -> Optional[bytes]:
         if last is not None:
             draw.line([last, p], fill=rgb, width=3)
         last = p
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _plot_intervals_png(blocks: list[dict], *, title: str) -> Optional[bytes]:
+    """
+    Render a compact timeline chart (run vs walk) from block summaries.
+    Uses Pillow (always available if pillow is installed).
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return None
+
+    # Keep only run/walk and meaningful durations.
+    parts: list[tuple[str, int]] = []
+    for b in blocks:
+        k = b.get("kind")
+        if k not in {"run", "walk"}:
+            continue
+        d = int(b.get("duration_s") or 0)
+        if d <= 10:
+            continue
+        parts.append((str(k), d))
+    if not parts:
+        return None
+
+    total = sum(d for _, d in parts)
+    if total <= 0:
+        return None
+
+    w, h = 1000, 170
+    pad = 18
+    bar_y0, bar_y1 = 62, 118
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((pad, 10), title, fill=(20, 20, 20))
+
+    x0 = pad
+    x1 = w - pad
+    cur = x0
+    run_c = (37, 99, 235)
+    walk_c = (16, 185, 129)
+
+    for kind, d in parts:
+        seg_w = max(1, int((x1 - x0) * (d / total)))
+        color = run_c if kind == "run" else walk_c
+        draw.rectangle([cur, bar_y0, min(x1, cur + seg_w), bar_y1], fill=color)
+        cur += seg_w
+        if cur >= x1:
+            break
+
+    # Border
+    draw.rectangle([x0, bar_y0, x1, bar_y1], outline=(200, 200, 200), width=2)
+
+    # Legend
+    lx, ly = pad, 132
+    draw.rectangle([lx, ly, lx + 18, ly + 10], fill=run_c)
+    draw.text((lx + 24, ly - 4), "run", fill=(60, 60, 60))
+    lx2 = lx + 90
+    draw.rectangle([lx2, ly, lx2 + 18, ly + 10], fill=walk_c)
+    draw.text((lx2 + 24, ly - 4), "walk", fill=(60, 60, 60))
+
+    # Total duration label
+    mm, ss = divmod(total, 60)
+    draw.text((w - pad - 140, 10), f"totale interval: {mm}:{ss:02d}", fill=(90, 90, 90))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
