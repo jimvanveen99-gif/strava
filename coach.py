@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
 
 STRAVA_TOKEN_URL = "https://www.strava.com/oauth/token"
 STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
+STRAVA_STREAMS_URL_TMPL = "https://www.strava.com/api/v3/activities/{activity_id}/streams"
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 
 
@@ -30,6 +31,20 @@ class Activity:
     average_heartrate: float | None
     max_heartrate: float | None
     type: str
+
+
+@dataclass(frozen=True)
+class Streams:
+    time_s: list[int]
+    heartrate_bpm: list[int] | None
+    velocity_mps: list[float] | None
+
+
+@dataclass(frozen=True)
+class Block:
+    kind: str  # "run" | "walk" | "pause"
+    start_idx: int
+    end_idx_exclusive: int
 
 
 def _env(name: str, default: str | None = None) -> str | None:
@@ -122,8 +137,80 @@ def list_activities(access_token: str, after: datetime, before: datetime) -> lis
     return out
 
 
+def fetch_streams(access_token: str, activity_id: int) -> Streams:
+    """
+    Fetch per-sample streams for an activity.
+    We request time + heartrate + velocity_smooth (pace).
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {
+        "keys": "time,heartrate,velocity_smooth",
+        "key_by_type": "true",
+    }
+    raw = _http_get_json(STRAVA_STREAMS_URL_TMPL.format(activity_id=activity_id), headers=headers, params=params)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Unexpected Strava streams response: {raw}")
+
+    def _get_list(key: str) -> list | None:
+        v = raw.get(key)
+        if not isinstance(v, dict):
+            return None
+        data = v.get("data")
+        if not isinstance(data, list):
+            return None
+        return data
+
+    time_data = _get_list("time")
+    if not time_data:
+        raise RuntimeError(f"Strava streams missing 'time' for activity {activity_id}: {raw}")
+
+    time_s: list[int] = []
+    for x in time_data:
+        try:
+            time_s.append(int(x))
+        except Exception:
+            pass
+    if not time_s:
+        raise RuntimeError(f"Invalid 'time' stream for activity {activity_id}")
+
+    hr_data = _get_list("heartrate")
+    heartrate_bpm: list[int] | None = None
+    if hr_data:
+        hr_out: list[int] = []
+        for x in hr_data:
+            try:
+                hr_out.append(int(x))
+            except Exception:
+                hr_out.append(0)
+        heartrate_bpm = hr_out if hr_out else None
+
+    vel_data = _get_list("velocity_smooth")
+    velocity_mps: list[float] | None = None
+    if vel_data:
+        vel_out: list[float] = []
+        for x in vel_data:
+            try:
+                vel_out.append(float(x))
+            except Exception:
+                vel_out.append(0.0)
+        velocity_mps = vel_out if vel_out else None
+
+    # align lengths
+    n = len(time_s)
+    if heartrate_bpm is not None:
+        n = min(n, len(heartrate_bpm))
+    if velocity_mps is not None:
+        n = min(n, len(velocity_mps))
+    time_s = time_s[:n]
+    if heartrate_bpm is not None:
+        heartrate_bpm = heartrate_bpm[:n]
+    if velocity_mps is not None:
+        velocity_mps = velocity_mps[:n]
+
+    return Streams(time_s=time_s, heartrate_bpm=heartrate_bpm, velocity_mps=velocity_mps)
+
+
 def is_running_activity(a: Activity) -> bool:
-    # Strava types vary; "Run" is typical. Keep flexible.
     return a.type.lower() in {"run", "trailrun", "virtualrun"}
 
 
@@ -151,13 +238,176 @@ def fmt_pace(p: float | None) -> str:
 
 
 def classify_run(a: Activity) -> str:
-    # Lightweight heuristic: if elapsed >> moving, there were substantial pauses -> likely run/walk or intervals.
     if a.moving_time_s <= 0:
         return "onbekend"
     ratio = a.elapsed_time_s / a.moving_time_s if a.elapsed_time_s else 1.0
     if ratio >= 1.20:
         return "run/walk of interval (veel pauzes)"
     return "rustige duur (aaneengesloten)"
+
+
+def _pace_from_velocity(velocity_mps: float | None) -> float | None:
+    return pace_min_per_km(velocity_mps)
+
+
+def segment_blocks(
+    streams: Streams,
+    *,
+    walk_pace_threshold_min_per_km: float = 7.75,  # ~7:45/km
+    pause_velocity_mps: float = 0.3,
+    min_block_seconds: int = 25,
+) -> list[Block]:
+    n = len(streams.time_s)
+    if n == 0:
+        return []
+
+    vel = streams.velocity_mps
+    if vel is None:
+        return [Block(kind="run", start_idx=0, end_idx_exclusive=n)]
+
+    def kind_at(i: int) -> str:
+        v = vel[i]
+        if v <= pause_velocity_mps:
+            return "pause"
+        p = _pace_from_velocity(v)
+        if p is None:
+            return "run"
+        return "walk" if p >= walk_pace_threshold_min_per_km else "run"
+
+    blocks: list[Block] = []
+    cur_kind = kind_at(0)
+    cur_start = 0
+
+    def duration_seconds(start_idx: int, end_idx_excl: int) -> int:
+        if end_idx_excl <= start_idx + 1:
+            return 0
+        return int(streams.time_s[end_idx_excl - 1] - streams.time_s[start_idx])
+
+    i = 1
+    while i < n:
+        k = kind_at(i)
+        if k == cur_kind:
+            i += 1
+            continue
+
+        cur_dur = duration_seconds(cur_start, i)
+        if cur_dur < min_block_seconds:
+            i += 1
+            continue
+
+        blocks.append(Block(kind=cur_kind, start_idx=cur_start, end_idx_exclusive=i))
+        cur_kind = k
+        cur_start = i
+        i += 1
+
+    if duration_seconds(cur_start, n) >= 1:
+        blocks.append(Block(kind=cur_kind, start_idx=cur_start, end_idx_exclusive=n))
+
+    merged: list[Block] = []
+    for b in blocks:
+        if merged and merged[-1].kind == b.kind and merged[-1].end_idx_exclusive == b.start_idx:
+            prev = merged[-1]
+            merged[-1] = Block(kind=prev.kind, start_idx=prev.start_idx, end_idx_exclusive=b.end_idx_exclusive)
+        else:
+            merged.append(b)
+    return merged
+
+
+def blocks_to_readable_pattern(block_summaries: list[dict]) -> str:
+    filtered = [b for b in block_summaries if (b.get("duration_s") or 0) >= 20 and b.get("kind") in {"run", "walk"}]
+    if len(filtered) < 2:
+        return "n.v.t."
+
+    first_run = next((b for b in filtered if b["kind"] == "run"), None)
+    if not first_run:
+        return "n.v.t."
+    run_dur = int(first_run["duration_s"])
+    idx = filtered.index(first_run)
+    first_walk = next((b for b in filtered[idx + 1 :] if b["kind"] == "walk"), None)
+    if not first_walk:
+        return f"run {run_dur//60}:{run_dur%60:02d} (aaneengesloten/blokken)"
+    walk_dur = int(first_walk["duration_s"])
+
+    def close(a: int, b: int) -> bool:
+        return abs(a - b) <= 40
+
+    pairs = 0
+    i = 0
+    while i < len(filtered) - 1:
+        if filtered[i]["kind"] == "run" and filtered[i + 1]["kind"] == "walk":
+            if close(int(filtered[i]["duration_s"]), run_dur) and close(int(filtered[i + 1]["duration_s"]), walk_dur):
+                pairs += 1
+                i += 2
+                continue
+        i += 1
+
+    return f"run {run_dur//60}:{run_dur%60:02d} / walk {walk_dur//60}:{walk_dur%60:02d} × {max(1, pairs)} (geschat)"
+
+
+def _avg(values: list[float] | list[int] | None) -> float | None:
+    if not values:
+        return None
+    if len(values) == 0:
+        return None
+    return float(sum(values) / len(values))
+
+
+def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
+    out: list[dict] = []
+    hr = streams.heartrate_bpm
+    vel = streams.velocity_mps
+
+    def block_duration(b: Block) -> int:
+        if b.end_idx_exclusive <= b.start_idx + 1:
+            return 0
+        return int(streams.time_s[b.end_idx_exclusive - 1] - streams.time_s[b.start_idx])
+
+    for b in blocks:
+        idxs = list(range(b.start_idx, b.end_idx_exclusive))
+        hr_vals: list[int] | None = [hr[i] for i in idxs if hr and hr[i] > 0] if hr else None
+        vel_vals: list[float] | None = [vel[i] for i in idxs if vel and vel[i] > 0] if vel else None
+
+        avg_vel = _avg(vel_vals)
+        avg_pace = _pace_from_velocity(avg_vel) if avg_vel is not None else None
+        avg_hr = _avg(hr_vals) if hr_vals else None
+
+        hr_start = None
+        hr_end = None
+        if hr_vals and hr:
+            for i in idxs:
+                if hr[i] > 0:
+                    hr_start = hr[i]
+                    break
+            for i in reversed(idxs):
+                if hr[i] > 0:
+                    hr_end = hr[i]
+                    break
+
+        hr_change = (hr_end - hr_start) if (hr_start is not None and hr_end is not None) else None
+
+        hr_drop_60s = None
+        if b.kind == "walk" and hr and hr_start is not None:
+            start_t = streams.time_s[b.start_idx]
+            target_t = start_t + 60
+            j = None
+            for ii in idxs:
+                if streams.time_s[ii] >= target_t and hr[ii] > 0:
+                    j = ii
+                    break
+            if j is not None:
+                hr_drop_60s = hr_start - hr[j]
+
+        out.append(
+            {
+                "kind": b.kind,
+                "duration_s": block_duration(b),
+                "avg_pace_min_per_km": (round(avg_pace, 2) if avg_pace is not None else None),
+                "avg_hr": (round(avg_hr, 1) if avg_hr is not None else None),
+                "hr_change": hr_change,
+                "hr_drop_60s": hr_drop_60s,
+            }
+        )
+    return out
 
 
 def week_range_amsterdam(now_utc: datetime) -> tuple[datetime, datetime, datetime, datetime]:
@@ -170,7 +420,6 @@ def week_range_amsterdam(now_utc: datetime) -> tuple[datetime, datetime, datetim
 
     tz = ZoneInfo("Europe/Amsterdam")
     now_local = now_utc.astimezone(tz)
-    # find start of current week (Mon)
     week_start_local = (now_local - timedelta(days=now_local.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -227,6 +476,39 @@ def build_week_summary(runs: list[Activity]) -> dict:
     }
 
 
+def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
+    detailed: list[dict] = []
+    for a in sorted(runs, key=lambda x: x.start_date):
+        try:
+            streams = fetch_streams(access_token, a.id)
+            blocks = segment_blocks(streams)
+            block_summaries = summarize_blocks(streams, blocks)
+            pattern = blocks_to_readable_pattern(block_summaries)
+        except Exception as e:
+            block_summaries = []
+            pattern = "n.v.t."
+            err = str(e)
+        else:
+            err = None
+
+        detailed.append(
+            {
+                "id": a.id,
+                "date": a.start_date.date().isoformat(),
+                "name": a.name,
+                "distance_km": round(a.distance_m / 1000.0, 2),
+                "moving_time_s": a.moving_time_s,
+                "elapsed_time_s": a.elapsed_time_s,
+                "avg_pace_min_per_km": pace_min_per_km(a.average_speed_mps),
+                "avg_hr": a.average_heartrate,
+                "pattern_estimate": pattern,
+                "blocks": block_summaries,
+                "streams_error": err,
+            }
+        )
+    return detailed
+
+
 def openai_generate_coach_email(week_summary: dict) -> str | None:
     api_key = _env("OPENAI_API_KEY")
     if not api_key:
@@ -238,11 +520,13 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
         "Je bent een Nederlandse AI hardloopcoach. Je schrijft concreet en praktisch, als een persoonlijke coach. "
         "Je maakt altijd een schema voor 1 week vooruit met 2 trainingen. "
         "De loper is beginner, traint 2x per week, komt van run/walk intervallen en traint daarnaast 4x per week kracht. "
-        "Doel: 10 km Singelloop Utrecht op 4 okt 2026 < 60 min (6:00/km), maar eerst veilig 10 km aaneengesloten kunnen lopen."
+        "Doel: 10 km Singelloop Utrecht op 4 okt 2026 < 60 min (6:00/km), maar eerst veilig 10 km aaneengesloten kunnen lopen. "
+        "Je baseert je analyse vooral op de intervalblokken uit runs_detailed (tempo + HR per blok), niet op de totale gemiddelden van de run."
     )
 
     user = {
         "week_summary": week_summary,
+        "runs_detailed": week_summary.get("runs_detailed"),
         "current_baseline": "3 min hardlopen / 2 min wandelen × 6 voelde haalbaar (laatste bekende training).",
         "output_structure": [
             "Korte analyse van mijn laatste training(en)",
@@ -253,7 +537,10 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
         "constraints": [
             "Bouw geleidelijk op (beginner, blessurepreventie).",
             "Geen algemene tips, maar specifiek advies op basis van de weekdata.",
+            "Gebruik vooral de blokken (run vs walk) uit runs_detailed om advies te geven over harder/zachter lopen en interval-opbouw.",
             "Tempo-indicaties in RPE/praattempo en (als mogelijk) min/km richting 6:00, maar niet forceren.",
+            "Als HR in loopblokken snel oploopt of herstel in wandelblokken slecht is (HR zakt weinig), adviseer rustiger lopen of dezelfde interval nog een week herhalen.",
+            "Als pace in loopblokken stabiel is en herstel goed is (HR daalt duidelijk binnen 60–90 sec), adviseer een kleine progressie: +30–60 sec lopen per blok of -15–30 sec wandelen.",
         ],
     }
 
@@ -290,6 +577,7 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
 
 def fallback_email(week_summary: dict) -> str:
     runs = week_summary.get("runs", [])
+    runs_detailed = week_summary.get("runs_detailed") or []
     lines = []
     lines.append("Korte analyse van je laatste training(en)")
     if not runs:
@@ -306,6 +594,20 @@ def fallback_email(week_summary: dict) -> str:
             lines.append(
                 f"- {r['date']}: {r['distance_km']} km in {r['moving_time']} (pace {r['avg_pace']}, type: {r['classification']})"
             )
+        if runs_detailed:
+            lines.append("")
+            lines.append("Intervalblokken (op basis van tempo/HR over tijd)")
+            for rd in runs_detailed:
+                lines.append(f"- {rd['date']}: patroon {rd.get('pattern_estimate')}")
+                if rd.get("streams_error"):
+                    lines.append(f"  - streams niet beschikbaar: {rd['streams_error']}")
+                    continue
+                blocks = rd.get("blocks") or []
+                for b in blocks[:10]:
+                    dur = int(b.get("duration_s") or 0)
+                    lines.append(
+                        f"  - {b.get('kind')}: {dur//60}:{dur%60:02d}, pace {fmt_pace(b.get('avg_pace_min_per_km'))}, HR {b.get('avg_hr')}, HRΔ {b.get('hr_change')}, HR↓60s {b.get('hr_drop_60s')}"
+                    )
 
     lines.append("")
     lines.append("Belangrijkste inzichten")
@@ -355,6 +657,7 @@ def main() -> int:
     acts = list_activities(access_token, after=after_utc, before=before_utc)
     runs = [a for a in acts if is_running_activity(a)]
     week_summary = build_week_summary(runs)
+    week_summary["runs_detailed"] = build_week_detailed(access_token, runs)
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
     subject = (
