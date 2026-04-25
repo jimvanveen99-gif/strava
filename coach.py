@@ -13,7 +13,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import html
 import io
+import re
 from email.mime.image import MIMEImage
+from typing import Optional, Union, Tuple, List, Dict, Any
 
 try:
     from zoneinfo import ZoneInfo  # py>=3.9
@@ -35,17 +37,17 @@ class Activity:
     distance_m: float
     moving_time_s: int
     elapsed_time_s: int
-    average_speed_mps: float | None
-    average_heartrate: float | None
-    max_heartrate: float | None
+    average_speed_mps: Optional[float]
+    average_heartrate: Optional[float]
+    max_heartrate: Optional[float]
     type: str
 
 
 @dataclass(frozen=True)
 class Streams:
     time_s: list[int]
-    heartrate_bpm: list[int] | None
-    velocity_mps: list[float] | None
+    heartrate_bpm: Optional[list[int]]
+    velocity_mps: Optional[list[float]]
 
 
 @dataclass(frozen=True)
@@ -55,7 +57,7 @@ class Block:
     end_idx_exclusive: int
 
 
-def _env(name: str, default: str | None = None) -> str | None:
+def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.environ.get(name)
     if v is None:
         return default
@@ -75,7 +77,7 @@ def _http_post_form(url: str, form: dict[str, str]) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_get_json(url: str, headers: dict[str, str], params: dict[str, str] | None = None) -> object:
+def _http_get_json(url: str, headers: dict[str, str], params: Optional[dict[str, str]] = None) -> object:
     if params:
         url = f"{url}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -159,7 +161,7 @@ def fetch_streams(access_token: str, activity_id: int) -> Streams:
     if not isinstance(raw, dict):
         raise RuntimeError(f"Unexpected Strava streams response: {raw}")
 
-    def _get_list(key: str) -> list | None:
+    def _get_list(key: str) -> Optional[list]:
         v = raw.get(key)
         if not isinstance(v, dict):
             return None
@@ -183,7 +185,7 @@ def fetch_streams(access_token: str, activity_id: int) -> Streams:
         raise RuntimeError(f"Invalid 'time' stream for activity {activity_id}")
 
     hr_data = _get_list("heartrate")
-    heartrate_bpm: list[int] | None = None
+    heartrate_bpm: Optional[list[int]] = None
     if hr_data:
         hr_out: list[int] = []
         for x in hr_data:
@@ -194,7 +196,7 @@ def fetch_streams(access_token: str, activity_id: int) -> Streams:
         heartrate_bpm = hr_out if hr_out else None
 
     vel_data = _get_list("velocity_smooth")
-    velocity_mps: list[float] | None = None
+    velocity_mps: Optional[list[float]] = None
     if vel_data:
         vel_out: list[float] = []
         for x in vel_data:
@@ -224,7 +226,7 @@ def is_running_activity(a: Activity) -> bool:
     return a.type.lower() in {"run", "trailrun", "virtualrun"}
 
 
-def pace_min_per_km(avg_speed_mps: float | None) -> float | None:
+def pace_min_per_km(avg_speed_mps: Optional[float]) -> Optional[float]:
     if not avg_speed_mps or avg_speed_mps <= 0:
         return None
     sec_per_km = 1000.0 / avg_speed_mps
@@ -239,7 +241,7 @@ def fmt_duration(seconds: int) -> str:
     return f"{m}m {s:02d}s"
 
 
-def fmt_pace(p: float | None) -> str:
+def fmt_pace(p: Optional[float]) -> str:
     if p is None:
         return "n.v.t."
     total_sec = int(round(p * 60))
@@ -257,14 +259,14 @@ def classify_run(a: Activity) -> str:
     return "rustige duur (aaneengesloten)"
 
 
-def _pace_from_velocity(velocity_mps: float | None) -> float | None:
+def _pace_from_velocity(velocity_mps: Optional[float]) -> Optional[float]:
     return pace_min_per_km(velocity_mps)
 
 
 def segment_blocks(
     streams: Streams,
     *,
-    walk_pace_threshold_min_per_km: float | None = None,  # auto if None
+    walk_pace_threshold_min_per_km: Optional[float] = None,  # auto if None
     pause_velocity_mps: float = 0.3,
     min_block_seconds: int = 45,
     smooth_window_seconds: int = 15,
@@ -285,15 +287,15 @@ def segment_blocks(
 
     # Build a smoothed pace series to avoid noisy flips.
     # We use a simple rolling median over ~smooth_window_seconds.
-    paces: list[float | None] = []
+    paces: list[Optional[float]] = []
     for v in vel:
         if v <= pause_velocity_mps:
             paces.append(None)
         else:
             paces.append(_pace_from_velocity(v))
 
-    def _rolling_median(values: list[float | None]) -> list[float | None]:
-        out: list[float | None] = [None] * len(values)
+    def _rolling_median(values: list[Optional[float]]) -> list[Optional[float]]:
+        out: list[Optional[float]] = [None] * len(values)
         w = max(5, smooth_window_seconds)
         for i in range(len(values)):
             # window by TIME, not by index (streams can be irregular)
@@ -467,7 +469,87 @@ def blocks_to_readable_pattern(block_summaries: list[dict]) -> str:
     return f"run {run_dur//60}:{run_dur%60:02d} / walk {walk_dur//60}:{walk_dur%60:02d} × {max(1, reps)} (geschat)"
 
 
-def _avg(values: list[float] | list[int] | None) -> float | None:
+def _parse_pattern_durations_seconds(pattern: str) -> Optional[tuple[int, int]]:
+    """
+    Parse pattern strings like:
+      "run 3:00 / walk 2:00 × 6 (geschat)"
+    Returns (run_seconds, walk_seconds).
+    """
+    m = re.search(r"run\s+(\d+):(\d{2})\s*/\s*walk\s+(\d+):(\d{2})", pattern, re.IGNORECASE)
+    if not m:
+        return None
+    rmin, rsec, wmin, wsec = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+    return (rmin * 60 + rsec, wmin * 60 + wsec)
+
+
+def planned_timer_blocks_from_streams(
+    streams: Streams,
+    *,
+    run_seconds: int,
+    walk_seconds: int,
+    reps: int = 6,
+    pause_velocity_mps: float = 0.3,
+) -> list[Block]:
+    """
+    Create blocks aligned to an intended run/walk timer (e.g. 3:00/2:00),
+    independent of stoplights and Strava's block segmentation.
+
+    We anchor at the first moment where velocity is above the pause threshold
+    (i.e. the run actually starts), then slice time into alternating windows.
+    """
+    if not streams.time_s or not streams.velocity_mps:
+        return []
+    if run_seconds <= 0 or walk_seconds <= 0 or reps <= 0:
+        return []
+
+    # Anchor at first non-pause sample.
+    start_idx = None
+    for i, v in enumerate(streams.velocity_mps):
+        if v is not None and v > pause_velocity_mps:
+            start_idx = i
+            break
+    if start_idx is None:
+        return []
+
+    start_t = streams.time_s[start_idx]
+
+    def idx_at_or_after(target_t: int) -> int:
+        # Find first index with time >= target_t (linear scan from start_idx; streams are small enough).
+        for j in range(start_idx, len(streams.time_s)):
+            if streams.time_s[j] >= target_t:
+                return j
+        return len(streams.time_s) - 1
+
+    out: list[Block] = []
+    cur_t = start_t
+    cur_idx = start_idx
+    for _ in range(reps):
+        # run window
+        run_end_t = cur_t + run_seconds
+        run_end_idx = idx_at_or_after(run_end_t)
+        out.append(Block(kind="run", start_idx=cur_idx, end_idx_exclusive=min(len(streams.time_s), run_end_idx + 1)))
+        cur_t = run_end_t
+        cur_idx = run_end_idx
+
+        # walk window
+        walk_end_t = cur_t + walk_seconds
+        walk_end_idx = idx_at_or_after(walk_end_t)
+        out.append(Block(kind="walk", start_idx=cur_idx, end_idx_exclusive=min(len(streams.time_s), walk_end_idx + 1)))
+        cur_t = walk_end_t
+        cur_idx = walk_end_idx
+
+        if cur_idx >= len(streams.time_s) - 2:
+            break
+
+    # Drop degenerate/empty blocks.
+    cleaned: list[Block] = []
+    for b in out:
+        if b.end_idx_exclusive > b.start_idx + 1:
+            cleaned.append(b)
+    return cleaned
+
+
+def _avg(values: Optional[Union[list[float], list[int]]]) -> Optional[float]:
     if not values:
         return None
     if len(values) == 0:
@@ -495,8 +577,8 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
 
     for b in blocks:
         idxs = list(range(b.start_idx, b.end_idx_exclusive))
-        hr_vals: list[int] | None = [hr[i] for i in idxs if hr and hr[i] > 0] if hr else None
-        vel_vals: list[float] | None = [vel[i] for i in idxs if vel and vel[i] > 0] if vel else None
+        hr_vals: Optional[list[int]] = [hr[i] for i in idxs if hr and hr[i] > 0] if hr else None
+        vel_vals: Optional[list[float]] = [vel[i] for i in idxs if vel and vel[i] > 0] if vel else None
 
         avg_vel = _avg(vel_vals)
         avg_pace = _pace_from_velocity(avg_vel) if avg_vel is not None else None
@@ -624,6 +706,20 @@ def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
             blocks = segment_blocks(streams)
             block_summaries = summarize_blocks(streams, blocks)
             pattern = blocks_to_readable_pattern(block_summaries)
+
+            # Also compute "timer-aligned" blocks for common run/walk training,
+            # so stoplights/manual pauses don't distort block durations.
+            timer_blocks = None
+            timer_block_summaries: Optional[list[dict]] = None
+            timer_pattern = None
+            parsed = _parse_pattern_durations_seconds(pattern)
+            # If we can't parse, fall back to baseline 3:00/2:00 (common for this project).
+            run_s, walk_s = parsed if parsed else (180, 120)
+            timer_blocks = planned_timer_blocks_from_streams(streams, run_seconds=run_s, walk_seconds=walk_s, reps=8)
+            if timer_blocks:
+                timer_block_summaries = summarize_blocks(streams, timer_blocks)
+                timer_pattern = f"run {run_s//60}:{run_s%60:02d} / walk {walk_s//60}:{walk_s%60:02d} (timer)"
+
             # Store a downsampled series for plotting (keep small).
             series = _downsample_series_for_chart(streams)
         except Exception as e:
@@ -631,6 +727,8 @@ def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
             pattern = "n.v.t."
             err = str(e)
             series = None
+            timer_block_summaries = None
+            timer_pattern = None
         else:
             err = None
 
@@ -646,6 +744,8 @@ def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
                 "avg_hr": a.average_heartrate,
                 "pattern_estimate": pattern,
                 "blocks": block_summaries,
+                "timer_pattern": timer_pattern,
+                "timer_blocks": timer_block_summaries,
                 "series": series,
                 "streams_error": err,
             }
@@ -653,7 +753,7 @@ def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
     return detailed
 
 
-def _downsample_series_for_chart(streams: Streams, max_points: int = 240) -> dict | None:
+def _downsample_series_for_chart(streams: Streams, max_points: int = 240) -> Optional[dict]:
     """
     Prepare a small (time, pace, hr) series for charting in email.
     Returns dict with minutes + values (some may be None).
@@ -665,8 +765,8 @@ def _downsample_series_for_chart(streams: Streams, max_points: int = 240) -> dic
     step = max(1, n // max_points)
 
     minutes: list[float] = []
-    pace: list[float | None] = []
-    hr: list[int | None] = []
+    pace: list[Optional[float]] = []
+    hr: list[Optional[int]] = []
 
     vel = streams.velocity_mps
     hrv = streams.heartrate_bpm
@@ -691,7 +791,7 @@ def _downsample_series_for_chart(streams: Streams, max_points: int = 240) -> dic
     return {"minutes": minutes, "pace_min_per_km": pace, "hr_bpm": hr}
 
 
-def openai_generate_coach_email(week_summary: dict) -> str | None:
+def openai_generate_coach_email(week_summary: dict) -> Optional[str]:
     api_key = _env("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -909,6 +1009,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
     blocks_html = []
     for rd in runs_detailed[:3]:
         blocks = rd.get("blocks") or []
+        timer_blocks = rd.get("timer_blocks") or []
         chart_html = ""
         cid_pace = inline_cids.get(f"{rd.get('id')}:pace")
         cid_hr = inline_cids.get(f"{rd.get('id')}:hr")
@@ -947,12 +1048,38 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
                 "</tr>"
             )
 
+        timer_table = ""
+        if timer_blocks:
+            trows = []
+            for b in timer_blocks[:18]:
+                dur = int(b.get("duration_s") or 0)
+                trows.append(
+                    "<tr>"
+                    f"<td><span class='pill'>{esc(b.get('kind'))}</span></td>"
+                    f"<td class='mono'>{dur//60}:{dur%60:02d}</td>"
+                    f"<td>{esc(fmt_pace(b.get('avg_pace_min_per_km')))}</td>"
+                    f"<td>{esc(b.get('avg_hr') or '—')}</td>"
+                    f"<td>{esc(b.get('hr_change') if b.get('hr_change') is not None else '—')}</td>"
+                    f"<td>{esc(b.get('hr_drop_60s') if b.get('hr_drop_60s') is not None else '—')}</td>"
+                    "</tr>"
+                )
+            timer_table = (
+                "<div style='margin-top:10px'>"
+                "<div class='muted' style='margin:6px 0'>Genormaliseerd volgens timer (minder gevoelig voor stoplichten)</div>"
+                "<table>"
+                "<thead><tr><th>Blok</th><th>Duur</th><th>Gem. tempo</th><th>Gem. HR</th><th>HRΔ</th><th>HR↓60s</th></tr></thead>"
+                f"<tbody>{''.join(trows)}</tbody>"
+                "</table>"
+                "</div>"
+            )
+
         blocks_html.append(
             header
             + "<table>"
             + "<thead><tr><th>Blok</th><th>Duur</th><th>Gem. tempo</th><th>Gem. HR</th><th>HRΔ</th><th>HR↓60s</th></tr></thead>"
             + f"<tbody>{''.join(rows) if rows else '<tr><td colspan=6>Geen blokken gevonden.</td></tr>'}</tbody>"
             + "</table>"
+            + timer_table
             + "</div>"
         )
 
@@ -1142,7 +1269,7 @@ def write_preview(subject: str, body: str, week_summary: dict, *, out_dir: str =
     return html_path
 
 
-def _plot_series_png(series: dict, *, kind: str) -> bytes | None:
+def _plot_series_png(series: dict, *, kind: str) -> Optional[bytes]:
     """
     Render a lightweight PNG chart for email (pace or hr).
     Uses matplotlib if available; returns PNG bytes.
