@@ -601,7 +601,10 @@ def coaching_from_timer_blocks(week_summary: dict) -> dict:
 
     # conservative heuristics for a beginner with city noise + strength training
     hr_guard = a_run_hr_end if a_run_hr_end is not None else a_run_hr
-    too_hard = (hr_guard is not None and hr_guard >= 170) or (a_drift is not None and a_drift >= 55)
+    max_end_hr = max(run_hr_end) if run_hr_end else None
+    # If any block ends very high, assume you "pushed" and prefer consolidating.
+    pushed_once = (max_end_hr is not None and max_end_hr >= 175)
+    too_hard = pushed_once or (hr_guard is not None and hr_guard >= 170) or (a_drift is not None and a_drift >= 55)
     poor_recovery = (a_drop is not None and a_drop < 15)
     good_recovery = (a_drop is not None and a_drop >= 25) and (hr_guard is None or hr_guard < 168)
 
@@ -628,6 +631,7 @@ def coaching_from_timer_blocks(week_summary: dict) -> dict:
         "next_step": next_step,
         "suggestion": suggestion,
         "delta_label": delta,
+        "max_end_hr": max_end_hr,
     }
 
 
@@ -1331,10 +1335,13 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
     next_step = str(coach.get("next_step") or "—")
 
     vlow = verdict.lower()
-    if "rustiger" in vlow:
+    max_end_hr = coach.get("max_end_hr")
+    if max_end_hr is not None and float(max_end_hr) >= 175:
+        pace_tip = "Je hebt minstens één loopblok duidelijk ‘aangezet’ (hoge eind-HR). Volgende keer bewust rustiger: praattempo en liever 10–20 sec/km langzamer."
+    elif "rustiger" in vlow:
         pace_tip = "Loop de loopblokken 10–20 sec/km rustiger dan vorige keer en hou strikt praattempo aan (niet ‘duwen’)."
     elif "stabiel" in vlow:
-        pace_tip = "Je mag de laatste 1–2 loopblokken iets vlotter (±5–10 sec/km), zolang je HR niet wegloopt en je herstel goed blijft."
+        pace_tip = "Je mag de laatste 1–2 loopblokken iets vlotter (±5–10 sec/km), zolang je eind-HR niet richting ~175+ gaat en je herstel goed blijft."
     else:
         pace_tip = "Hou het tempo gelijk en focus op ontspannen loopblokken. Versnellen pas als dit 2 weken stabiel blijft."
 
