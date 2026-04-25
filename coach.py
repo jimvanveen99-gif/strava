@@ -712,13 +712,13 @@ def build_plan(week_summary: dict) -> dict:
     prev = plan_weeks.get(prev_w) or {}
     cur = plan_weeks.get(next_w1) or {}
 
-    delta_lines = []
+    delta_t1 = "—"
+    delta_t2 = "—"
     if prev and cur:
         if prev.get("t1") != cur.get("t1"):
-            delta_lines.append(f"Training 1: {prev.get('t1')} → {cur.get('t1')}")
+            delta_t1 = f"{prev.get('t1')} → {cur.get('t1')}"
         if prev.get("t2") != cur.get("t2"):
-            delta_lines.append(f"Training 2: {prev.get('t2')} → {cur.get('t2')}")
-    delta_label = "\n".join(delta_lines) if delta_lines else "Geen verandering t.o.v. vorige week."
+            delta_t2 = f"{prev.get('t2')} → {cur.get('t2')}"
 
     coach = coaching_from_timer_blocks(week_summary)
     # Align "next_step" with the fixed plan so it never conflicts with the schedule.
@@ -738,7 +738,15 @@ def build_plan(week_summary: dict) -> dict:
         "plan_name": plan_doc.get("plan_name") or "training_plan.json",
         "coach": coach,
         "next_2_weeks": [
-            {**r, "delta": delta_label if r["week"] == f"Week {next_w1}" else "—", "why": "Plan volgens jouw 16-week schema; we gebruiken Strava-data alleen om tempo/HR-advies te geven en eventueel te waarschuwen."}
+            {
+                **r,
+                "delta": (
+                    (delta_t1 if r.get("session") == "Training 1" else delta_t2)
+                    if r.get("week") == f"Week {next_w1}"
+                    else "—"
+                ),
+                "why": "",
+            }
             for r in rows
         ],
         "roadmap": [{"week": f"Week {i}", "focus": plan_weeks[i]["t1"], "target": plan_weeks[i]["t2"]} for i in range(1, 17)],
@@ -1294,15 +1302,15 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
                 f"<td><b>{esc(row.get('session'))}</b><div class='muted'>{esc(row.get('when'))}</div></td>"
                 f"<td class='mono'>{esc(row.get('workout'))}</td>"
                 f"<td class='mono'>{esc(row.get('delta'))}</td>"
-                f"<td class='mono'>{esc(row.get('why'))}</td>"
                 "</tr>"
             )
         schema_html = (
             "<div class='card'>"
             "<h2>Schema (komende 2 weken)</h2>"
             + (f"<div class='muted'>Bron: {esc(plan_name)}</div>" if plan_name else "")
+            + "<div class='muted' style='margin-top:6px'>Schema komt uit je vaste plan. De data gebruiken we voor tempo/HR-coaching en om te waarschuwen als het te zwaar is.</div>"
             + "<table>"
-            "<thead><tr><th>Week</th><th>Training</th><th>Workout</th><th>Verandering</th><th>Waarom</th></tr></thead>"
+            "<thead><tr><th>Week</th><th>Training</th><th>Workout</th><th>Verandering</th></tr></thead>"
             f"<tbody>{''.join(tr)}</tbody>"
             "</table>"
             "</div>"
@@ -1327,6 +1335,18 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         f"<div class='mono'>{esc(coach_text_only)}</div>"
         "</div>"
     )
+
+    # When applicable, show the "rewrite full schema" prompt near the bottom.
+    rewrite = week_summary.get("schema_rewrite_prompt")
+    rewrite_html = ""
+    if isinstance(rewrite, dict) and rewrite.get("prompt"):
+        rewrite_html = (
+            "<div class='card'>"
+            "<h2>ChatGPT prompt (schema herzien)</h2>"
+            "<div class='muted'>Alleen gebruiken als je de volledige planning (week 1–16) opnieuw wilt laten maken.</div>"
+            f"<div class='mono'>{esc(rewrite.get('prompt'))}</div>"
+            "</div>"
+        )
 
     # Deterministic coaching summary (pace/effort guidance)
     coach = plan.get("coach") or coaching_from_timer_blocks(week_summary)
@@ -1368,6 +1388,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         f"{schema_html}"
         f"{roadmap_html}"
         f"{coach_text_html}"
+        f"{rewrite_html}"
         "</body></html>"
     )
 
@@ -1729,6 +1750,14 @@ def main() -> int:
     build_label = (sha[:7] if sha else None) or now_utc.strftime("%Y%m%d-%H%M")
     week_summary["build_info"] = {"label": build_label}
     week_summary["plan"] = build_plan(week_summary)
+    # Optional: prompt to rewrite the full plan (only set when conditions are met).
+    # We compute it here so it can be displayed in the HTML email.
+    try:
+        # schema_rewrite_prompt may not exist in older versions; guard with globals().
+        if "schema_rewrite_prompt" in globals():
+            week_summary["schema_rewrite_prompt"] = globals()["schema_rewrite_prompt"](week_summary)  # type: ignore
+    except Exception:
+        pass
     # Add race countdown for the LLM / email.
     try:
         if ZoneInfo is not None:
