@@ -261,9 +261,10 @@ def _pace_from_velocity(velocity_mps: float | None) -> float | None:
 def segment_blocks(
     streams: Streams,
     *,
-    walk_pace_threshold_min_per_km: float = 7.75,  # ~7:45/km
+    walk_pace_threshold_min_per_km: float | None = None,  # auto if None
     pause_velocity_mps: float = 0.3,
-    min_block_seconds: int = 25,
+    min_block_seconds: int = 45,
+    smooth_window_seconds: int = 15,
 ) -> list[Block]:
     """
     Segment a run into run/walk/pause blocks from streams.
@@ -279,14 +280,71 @@ def segment_blocks(
         # Can't reliably segment run vs walk; return one unknown-ish run block.
         return [Block(kind="run", start_idx=0, end_idx_exclusive=n)]
 
+    # Build a smoothed pace series to avoid noisy flips.
+    # We use a simple rolling median over ~smooth_window_seconds.
+    paces: list[float | None] = []
+    for v in vel:
+        if v <= pause_velocity_mps:
+            paces.append(None)
+        else:
+            paces.append(_pace_from_velocity(v))
+
+    def _rolling_median(values: list[float | None]) -> list[float | None]:
+        out: list[float | None] = [None] * len(values)
+        w = max(1, smooth_window_seconds)
+        for i in range(len(values)):
+            # window by index (streams are ~1Hz; good enough for our use)
+            start = max(0, i - w)
+            end = min(len(values), i + w + 1)
+            window = [x for x in values[start:end] if x is not None]
+            if not window:
+                out[i] = None
+                continue
+            window.sort()
+            out[i] = window[len(window) // 2]
+        return out
+
+    smooth_paces = _rolling_median(paces)
+
+    # Auto threshold: find two clusters (run vs walk) in observed paces.
+    # Simple 1D k-means with 2 centroids.
+    if walk_pace_threshold_min_per_km is None:
+        observed = [p for p in smooth_paces if p is not None and 3.0 <= p <= 20.0]
+        if len(observed) >= 30:
+            observed_sorted = sorted(observed)
+            c1 = observed_sorted[int(len(observed_sorted) * 0.25)]
+            c2 = observed_sorted[int(len(observed_sorted) * 0.75)]
+            if c1 > c2:
+                c1, c2 = c2, c1
+            for _ in range(10):
+                g1: list[float] = []
+                g2: list[float] = []
+                for p in observed:
+                    if abs(p - c1) <= abs(p - c2):
+                        g1.append(p)
+                    else:
+                        g2.append(p)
+                if g1:
+                    c1 = sum(g1) / len(g1)
+                if g2:
+                    c2 = sum(g2) / len(g2)
+                if c1 > c2:
+                    c1, c2 = c2, c1
+            walk_pace_threshold_min_per_km = (c1 + c2) / 2.0
+        else:
+            # Fallback default if too little data
+            walk_pace_threshold_min_per_km = 8.0  # ~8:00/km
+
+    threshold = float(walk_pace_threshold_min_per_km)
+
     def kind_at(i: int) -> str:
         v = vel[i]
         if v <= pause_velocity_mps:
             return "pause"
-        p = _pace_from_velocity(v)
+        p = smooth_paces[i]
         if p is None:
             return "run"
-        return "walk" if p >= walk_pace_threshold_min_per_km else "run"
+        return "walk" if p >= threshold else "run"
 
     blocks: list[Block] = []
     cur_kind = kind_at(0)
@@ -295,7 +353,7 @@ def segment_blocks(
     def duration_seconds(start_idx: int, end_idx_excl: int) -> int:
         if end_idx_excl <= start_idx + 1:
             return 0
-        return int(streams.time_s[end_idx_excl - 1] - streams.time_s[start_idx])
+        return int(streams.time_s[end_idx_excl - 1] - streams.time_s[start_idx] + 1)
 
     i = 1
     while i < n:
@@ -555,7 +613,7 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
 
     system = (
         "Je bent een Nederlandse AI hardloopcoach. Je schrijft concreet en praktisch, als een persoonlijke coach. "
-        "Je maakt altijd een schema voor 1 week vooruit met 2 trainingen. "
+        "Je maakt altijd een schema voor 2 weken vooruit met 2 trainingen per week. "
         "De loper is beginner, traint 2x per week, komt van run/walk intervallen en traint daarnaast 4x per week kracht. "
         "Doel: 10 km Singelloop Utrecht op 4 okt 2026 < 60 min (6:00/km), maar eerst veilig 10 km aaneengesloten kunnen lopen. "
         "Je baseert je analyse vooral op de intervalblokken uit runs_detailed (tempo + HR per blok), niet op de totale gemiddelden van de run."
@@ -565,11 +623,16 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
         "week_summary": week_summary,
         "runs_detailed": week_summary.get("runs_detailed"),
         "current_baseline": "3 min hardlopen / 2 min wandelen × 6 voelde haalbaar (laatste bekende training).",
+        "race": {
+            "name": "Singelloop Utrecht 10 km",
+            "date": "2026-10-04",
+        },
         "output_structure": [
             "Korte analyse van mijn laatste training(en)",
             "Belangrijkste inzichten (bullet points)",
             "Eventuele risico’s",
-            "Concreet schema voor de volgende week (2 trainingen, volledig uitgeschreven)",
+            "Concreet schema voor de komende 2 weken (4 trainingen, volledig uitgeschreven)",
+            "Op schema? (korte indicatie richting 10 km < 60 min)",
         ],
         "constraints": [
             "Bouw geleidelijk op (beginner, blessurepreventie).",
@@ -578,6 +641,7 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
             "Tempo-indicaties in RPE/praattempo en (als mogelijk) min/km richting 6:00, maar niet forceren.",
             "Als HR in loopblokken snel oploopt of herstel in wandelblokken slecht is (HR zakt weinig), adviseer rustiger lopen of dezelfde interval nog een week herhalen.",
             "Als pace in loopblokken stabiel is en herstel goed is (HR daalt duidelijk binnen 60–90 sec), adviseer een kleine progressie: +30–60 sec lopen per blok of -15–30 sec wandelen.",
+            "Houd rekening met 4x per week sportschool: liever iets te rustig dan te agressief opbouwen.",
         ],
     }
 
@@ -754,10 +818,25 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict) -> str
             + "</div>"
         )
 
+    # Split out the schedule section so it stands out.
+    schema_html = ""
+    coach_text_only = plain_text
+    marker = "Concreet schema"
+    if marker in plain_text:
+        before, after = plain_text.split(marker, 1)
+        coach_text_only = before.strip()
+        schema_text = (marker + after).strip()
+        schema_html = (
+            "<div class='card'>"
+            "<h2>Schema</h2>"
+            f"<div class='mono'>{esc(schema_text)}</div>"
+            "</div>"
+        )
+
     coach_text_html = (
         "<div class='card'>"
         "<h2>Coachbericht</h2>"
-        f"<div class='mono'>{esc(plain_text)}</div>"
+        f"<div class='mono'>{esc(coach_text_only)}</div>"
         "</div>"
     )
 
@@ -768,6 +847,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict) -> str
         f"<div class='meta'>{esc(subject)}</div>"
         f"{summary_table}"
         f"{''.join(blocks_html)}"
+        f"{schema_html}"
         f"{coach_text_html}"
         "</body></html>"
     )
@@ -809,6 +889,16 @@ def main() -> int:
     runs = [a for a in acts if is_running_activity(a)]
     week_summary = build_week_summary(runs)
     week_summary["runs_detailed"] = build_week_detailed(access_token, runs)
+    # Add race countdown for the LLM / email.
+    try:
+        if ZoneInfo is not None:
+            tz = ZoneInfo("Europe/Amsterdam")
+            now_local = now_utc.astimezone(tz)
+            race_date_local = datetime(2026, 10, 4, 0, 0, 0, tzinfo=tz)
+            days = max(0, (race_date_local.date() - now_local.date()).days)
+            week_summary["race_countdown"] = {"days": days, "weeks": round(days / 7.0, 1)}
+    except Exception:
+        pass
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
     subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()})"
