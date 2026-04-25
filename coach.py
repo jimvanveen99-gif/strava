@@ -549,6 +549,147 @@ def planned_timer_blocks_from_streams(
     return cleaned
 
 
+def _latest_run_with_timer(week_summary: dict) -> Optional[dict]:
+    rds = [x for x in (week_summary.get("runs_detailed") or []) if isinstance(x, dict)]
+    if not rds:
+        return None
+    rds_sorted = sorted(rds, key=lambda x: str(x.get("date") or ""))
+    return rds_sorted[-1]
+
+
+def coaching_from_timer_blocks(week_summary: dict) -> dict:
+    """
+    Produce a deterministic coaching verdict + next step based on timer-normalized blocks.
+    """
+    rd = _latest_run_with_timer(week_summary)
+    if not rd:
+        return {"verdict": "geen data", "details": None, "next_step": "Geen runs gevonden deze week. Doe 3:00/2:00 × 6 op praattempo."}
+
+    blocks = rd.get("timer_blocks") or []
+    run_blocks = [b for b in blocks if b.get("kind") == "run"]
+    walk_blocks = [b for b in blocks if b.get("kind") == "walk"]
+    if not run_blocks:
+        return {"verdict": "onvoldoende data", "details": rd.get("streams_error"), "next_step": "Doe 3:00/2:00 × 6 op praattempo."}
+
+    run_hr = [float(b["avg_hr"]) for b in run_blocks if b.get("avg_hr") is not None]
+    walk_drop = [float(b["hr_drop_60s"]) for b in walk_blocks if b.get("hr_drop_60s") is not None]
+    run_drift = [float(b["hr_change"]) for b in run_blocks if b.get("hr_change") is not None]
+
+    def avg(xs: list[float]) -> Optional[float]:
+        return (sum(xs) / len(xs)) if xs else None
+
+    a_run_hr = avg(run_hr)
+    a_drop = avg(walk_drop)
+    a_drift = avg(run_drift)
+
+    details = []
+    if a_run_hr is not None:
+        details.append(f"gem. HR loopblokken: {int(round(a_run_hr))} bpm")
+    if a_drop is not None:
+        details.append(f"HR↓60s (wandelblokken): {int(round(a_drop))} bpm")
+    if a_drift is not None:
+        details.append(f"HRΔ (loopblokken): {int(round(a_drift))} bpm")
+
+    # conservative heuristics for a beginner with city noise + strength training
+    too_hard = (a_run_hr is not None and a_run_hr >= 170) or (a_drift is not None and a_drift >= 55)
+    poor_recovery = (a_drop is not None and a_drop < 15)
+    good_recovery = (a_drop is not None and a_drop >= 25) and (a_run_hr is None or a_run_hr < 168)
+
+    if too_hard or poor_recovery:
+        verdict = "rustiger / consolideren"
+        next_step = "Herhaal 3:00 lopen / 2:00 wandelen × 6, maar loop de loopblokken rustiger (praattempo)."
+        suggestion = {"run_s": 180, "walk_s": 120, "reps": 6}
+        delta = "zelfde als vorige week (focus: rustiger)"
+    elif good_recovery:
+        verdict = "stabiel → kleine progressie"
+        # default progressive step: +30s run
+        next_step = "Kleine progressie: 3:30 lopen / 2:00 wandelen × 6 (of alternatief: 3:00/1:45 × 6)."
+        suggestion = {"run_s": 210, "walk_s": 120, "reps": 6}
+        delta = "+30s lopen per blok"
+    else:
+        verdict = "oké → nog 1 week vasthouden"
+        next_step = "Nog één week 3:00/2:00 × 6 consolideren; als dit stabiel blijft, daarna +30s lopen per blok."
+        suggestion = {"run_s": 180, "walk_s": 120, "reps": 6}
+        delta = "zelfde als vorige week"
+
+    return {
+        "verdict": verdict,
+        "details": ", ".join(details) if details else None,
+        "next_step": next_step,
+        "suggestion": suggestion,
+        "delta_label": delta,
+    }
+
+
+def build_plan(week_summary: dict) -> dict:
+    """
+    Build (1) next 2 weeks schedule and (2) a compact roadmap until race day.
+    """
+    coach = coaching_from_timer_blocks(week_summary)
+    sug = coach.get("suggestion") or {"run_s": 180, "walk_s": 120, "reps": 6}
+    run_s = int(sug.get("run_s") or 180)
+    walk_s = int(sug.get("walk_s") or 120)
+    reps = int(sug.get("reps") or 6)
+
+    def fmt_interval(rs: int, ws: int, n: int) -> str:
+        return f"5–8 min warm-up wandelen/joggen, dan {rs//60}:{rs%60:02d} lopen / {ws//60}:{ws%60:02d} wandelen × {n}, 5–8 min uitwandelen."
+
+    next_2_weeks = [
+        {
+            "week": "Week 1",
+            "session": "Training A",
+            "when": "begin week (ma/di/wo)",
+            "workout": fmt_interval(run_s, walk_s, reps),
+            "delta": coach.get("delta_label") or "—",
+            "why": "Opbouw op basis van herstel/HR in je laatste run; doel is stabiele, comfortabele loopblokken.",
+        },
+        {
+            "week": "Week 1",
+            "session": "Training B",
+            "when": "weekend",
+            "workout": "Easy duur op praattempo: 35–45 min totaal. Gebruik run/walk als nodig (bijv. 3:00/2:00) en vermijd ‘duwen’.",
+            "delta": "volume / soepelheid",
+            "why": "Extra aerobe prikkel zonder je krachttraining te slopen; bouwt conditie veilig op.",
+        },
+        {
+            "week": "Week 2",
+            "session": "Training A",
+            "when": "begin week (ma/di/wo)",
+            "workout": fmt_interval(min(run_s + 30, 300), walk_s, reps) if coach.get("verdict") == "stabiel → kleine progressie" else fmt_interval(run_s, walk_s, reps),
+            "delta": "kleine stap (alleen als Week 1 goed voelde)",
+            "why": "Progressie alleen als HR en gevoel stabiel blijven; anders consolideren.",
+        },
+        {
+            "week": "Week 2",
+            "session": "Training B",
+            "when": "weekend",
+            "workout": "Easy duur op praattempo: 40–50 min totaal. Eindig met 4× 20s ‘vlotte pas’ (niet sprinten) als je je fris voelt.",
+            "delta": "+5 min (als herstel goed is)",
+            "why": "Langzaam duurvolume omhoog; kleine prikkel voor loopeconomie zonder hoge hartslag.",
+        },
+    ]
+
+    # Roadmap: very compact, week blocks towards race date.
+    race = week_summary.get("race_countdown") or {}
+    weeks_left = int(round(float(race.get("weeks") or 0))) if race.get("weeks") is not None else 0
+    weeks_left = max(0, weeks_left)
+    roadmap = []
+    for i in range(min(weeks_left, 16)):  # keep short
+        wk = i + 1
+        if wk <= 6:
+            focus = "Opbouw aaneengesloten lopen"
+            target = "meer looptijd per blok, HR stabiel"
+        elif wk <= 12:
+            focus = "Duur + lichte tempo-prikkels"
+            target = "richting 6:30–6:00/km stukken, zonder forceren"
+        else:
+            focus = "Specifieker richting 10 km"
+            target = "tempo-blokken + taper"
+        roadmap.append({"week": f"Week {wk}", "focus": focus, "target": target})
+
+    return {"coach": coach, "next_2_weeks": next_2_weeks, "roadmap": roadmap}
+
+
 def _avg(values: Optional[Union[list[float], list[int]]]) -> Optional[float]:
     if not values:
         return None
@@ -954,10 +1095,7 @@ def fallback_email(week_summary: dict) -> str:
     lines.append("")
     lines.append("Eventuele risico’s")
     lines.append("- Als je pijn krijgt die 48 uur blijft (scheen/knie/achilles): stap terug en laat het weten.")
-    lines.append("")
-    lines.append("Concreet schema voor de volgende week (2 trainingen)")
-    lines.append("Training 1: 5 min wandelen, dan 4 min lopen / 2 min wandelen × 6, 5–8 min uitwandelen.")
-    lines.append("Training 2: 5 min wandelen, dan 3 min lopen / 1.5 min wandelen × 8, 5–8 min uitwandelen.")
+    # The actual plan is rendered in the HTML email from week_summary["plan"].
     return "\n".join(lines)
 
 
@@ -1074,51 +1212,44 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
     # Split out the schedule section so it stands out.
     schema_html = ""
     coach_text_only = plain_text
-    marker = "Concreet schema"
-    if marker in plain_text:
-        before, after = plain_text.split(marker, 1)
-        coach_text_only = before.strip()
-        schema_text = (marker + after).strip()
-        # Try to render as a simple table (Week/Training/Content) if it looks structured.
-        lines = [ln.strip() for ln in schema_text.splitlines() if ln.strip()]
-        rows = []
-        cur_week = ""
-        for ln in lines:
-            if ln.lower().startswith("week"):
-                cur_week = ln
-                continue
-            if ln.lower().startswith("training"):
-                rows.append((cur_week, ln, ""))
-                continue
-            if rows:
-                w, t, c = rows[-1]
-                rows[-1] = (w, t, (c + ("\n" if c else "") + ln))
-        if rows:
-            tr = []
-            for w, t, c in rows:
-                tr.append(
-                    "<tr>"
-                    f"<td>{esc(w or '—')}</td>"
-                    f"<td><b>{esc(t)}</b></td>"
-                    f"<td class='mono'>{esc(c)}</td>"
-                    "</tr>"
-                )
-            schema_html = (
-                "<div class='card'>"
-                "<h2>Schema (2 weken)</h2>"
-                "<table>"
-                "<thead><tr><th>Week</th><th>Training</th><th>Instructies</th></tr></thead>"
-                f"<tbody>{''.join(tr)}</tbody>"
-                "</table>"
-                "</div>"
+
+    plan = week_summary.get("plan") or {}
+    next_2w = plan.get("next_2_weeks") or []
+    roadmap = plan.get("roadmap") or []
+    if next_2w:
+        tr = []
+        for row in next_2w:
+            tr.append(
+                "<tr>"
+                f"<td>{esc(row.get('week'))}</td>"
+                f"<td><b>{esc(row.get('session'))}</b><div class='muted'>{esc(row.get('when'))}</div></td>"
+                f"<td class='mono'>{esc(row.get('workout'))}</td>"
+                f"<td class='mono'>{esc(row.get('delta'))}</td>"
+                f"<td class='mono'>{esc(row.get('why'))}</td>"
+                "</tr>"
             )
-        else:
-            schema_html = (
-                "<div class='card'>"
-                "<h2>Schema</h2>"
-                f"<div class='mono'>{esc(schema_text)}</div>"
-                "</div>"
-            )
+        schema_html = (
+            "<div class='card'>"
+            "<h2>Schema (komende 2 weken)</h2>"
+            "<table>"
+            "<thead><tr><th>Week</th><th>Training</th><th>Workout</th><th>Verandering</th><th>Waarom</th></tr></thead>"
+            f"<tbody>{''.join(tr)}</tbody>"
+            "</table>"
+            "</div>"
+        )
+
+    roadmap_html = ""
+    if roadmap:
+        items = []
+        for it in roadmap[:12]:
+            items.append(f"<li><b>{esc(it.get('week'))}</b>: {esc(it.get('focus'))} <span class='muted'>({esc(it.get('target'))})</span></li>")
+        roadmap_html = (
+            "<div class='card'>"
+            "<h2>Roadmap t/m Singelloop</h2>"
+            "<div class='muted'>Korte routekaart; we sturen elke week bij op basis van je Strava-data.</div>"
+            f"<ul>{''.join(items)}</ul>"
+            "</div>"
+        )
 
     coach_text_html = (
         "<div class='card'>"
@@ -1137,6 +1268,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         f"{summary_table}"
         f"{''.join(blocks_html)}"
         f"{schema_html}"
+        f"{roadmap_html}"
         f"{coach_text_html}"
         "</body></html>"
     )
@@ -1148,12 +1280,14 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
     if not gmail_user or not gmail_app_password or not mail_to:
         raise SystemExit("Missing GMAIL_USER / GMAIL_APP_PASSWORD / MAIL_TO env vars.")
 
-    # We send a multipart/related container so we can embed inline PNG charts,
-    # with a nested multipart/alternative (plain + html).
-    msg = MIMEMultipart("related")
+    # Outer container is multipart/mixed so attachments show up reliably (Apple Mail).
+    # Inside it we include a multipart/related with multipart/alternative (plain + html) plus inline images.
+    msg = MIMEMultipart("mixed")
     msg["From"] = gmail_user
     msg["To"] = mail_to
     msg["Subject"] = subject
+
+    related = MIMEMultipart("related")
 
     alt = MIMEMultipart("alternative")
     alt.attach(MIMEText(body, "plain", "utf-8"))
@@ -1184,16 +1318,20 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
 
     html_body = _render_html_email(subject, body, week_summary, inline_cids)
     alt.attach(MIMEText(html_body, "html", "utf-8"))
-    msg.attach(alt)
+    related.attach(alt)
 
+    # Inline images (referenced via cid:)
     for cid, data in images:
         img = MIMEImage(data, _subtype="png")
         img.add_header("Content-ID", f"<{cid}>")
-        # Some email clients hide inline images. We mark them inline but also give a filename so they show up as attachments.
         img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
-        msg.attach(img)
+        related.attach(img)
 
-        # Also attach as a normal attachment so Apple Mail shows it reliably.
+    # Attach the related container first (so the HTML can render inline images).
+    msg.attach(related)
+
+    # Also attach the images as regular attachments (so clients show a paperclip).
+    for cid, data in images:
         att = MIMEImage(data, _subtype="png")
         att.add_header("Content-Disposition", "attachment", filename=f"{cid}.png")
         msg.attach(att)
@@ -1492,6 +1630,7 @@ def main() -> int:
     sha = _env("GITHUB_SHA")
     build_label = (sha[:7] if sha else None) or now_utc.strftime("%Y%m%d-%H%M")
     week_summary["build_info"] = {"label": build_label}
+    week_summary["plan"] = build_plan(week_summary)
     # Add race countdown for the LLM / email.
     try:
         if ZoneInfo is not None:
@@ -1503,6 +1642,7 @@ def main() -> int:
     except Exception:
         pass
 
+    # Use OpenAI for narrative coaching if available; otherwise fall back.
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
     subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()}) [{build_label}]"
     if args.dry_run:
