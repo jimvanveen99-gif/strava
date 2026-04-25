@@ -626,30 +626,40 @@ def build_plan(week_summary: dict) -> dict:
     Use Jim's fixed 16-week plan as source of truth.
     The email shows the next 2 weeks + the delta vs last week.
     """
-    plan_weeks = {
-        1: {"t1": "3 min lopen / 2 min wandelen × 6", "t2": "20 min rustig hardlopen"},
-        2: {"t1": "3 min / 2 min × 7", "t2": "25 min rustig"},
-        3: {"t1": "4 min / 2 min × 5", "t2": "28 min rustig"},
-        4: {"t1": "5 min / 2 min × 4", "t2": "30 min rustig"},
-        5: {"t1": "8 min / 2 min × 3", "t2": "32 min rustig"},
-        6: {"t1": "10 min / 2 min × 3", "t2": "35 min rustig"},
-        7: {"t1": "12 min / 2 min × 2 + 8 min lopen", "t2": "38 min rustig"},
-        8: {"t1": "20 min aaneengesloten + 5 min extra", "t2": "40 min rustig"},
-        9: {"t1": "3 × 8 min op tempo (±6:15–6:20/km)", "t2": "45 min rustig"},
-        10: {"t1": "2 × 12 min op tempo", "t2": "50 min rustig"},
-        11: {"t1": "25 min steady (niet maximaal)", "t2": "55 min rustig"},
-        12: {"t1": "30 min aaneengesloten", "t2": "60 min rustig"},
-        13: {"t1": "3 × 10 min op 6:00–6:10/km", "t2": "60 min rustig"},
-        14: {"t1": "2 × 15 min op 6:00/km", "t2": "65 min rustig"},
-        15: {"t1": "25 min op 6:00/km", "t2": "45 min rustig"},
-        16: {"t1": "20 min relaxed", "t2": "RACE (10 km)"},
-    }
+    def _load_plan_file() -> Optional[dict]:
+        candidates = [
+            os.path.join(os.path.dirname(__file__), "training_plan.json"),
+            "training_plan.json",
+        ]
+        for p in candidates:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                continue
+        return None
+
+    plan_doc = _load_plan_file() or {}
+    weeks_list = plan_doc.get("weeks") or []
+    plan_weeks: dict[int, dict] = {}
+    for w in weeks_list:
+        try:
+            wi = int(w.get("week"))
+        except Exception:
+            continue
+        t1 = w.get("t1")
+        t2 = w.get("t2")
+        if not t1 or not t2:
+            continue
+        plan_weeks[wi] = {"t1": str(t1), "t2": str(t2)}
 
     # Week numbering: by default, treat the first week we run this as Week 1.
-    # You can pin it by setting TRAINING_PLAN_START_DATE=YYYY-MM-DD (Monday).
+    # You can pin it by:
+    # - setting TRAINING_PLAN_START_DATE=YYYY-MM-DD (Monday), or
+    # - filling training_plan.json: {"start_date": "YYYY-MM-DD"}
     tz = ZoneInfo("Europe/Amsterdam") if ZoneInfo is not None else None
     today = datetime.now(timezone.utc).astimezone(tz).date() if tz else datetime.now(timezone.utc).date()
-    start_env = _env("TRAINING_PLAN_START_DATE")
+    start_env = _env("TRAINING_PLAN_START_DATE") or plan_doc.get("start_date")
     if start_env:
         try:
             start_date = datetime.fromisoformat(start_env).date()
@@ -696,6 +706,7 @@ def build_plan(week_summary: dict) -> dict:
 
     coach = coaching_from_timer_blocks(week_summary)
     return {
+        "plan_name": plan_doc.get("plan_name") or "training_plan.json",
         "coach": coach,
         "next_2_weeks": [
             {**r, "delta": delta_label if r["week"] == f"Week {next_w1}" else "—", "why": "Plan volgens jouw 16-week schema; we gebruiken Strava-data alleen om tempo/HR-advies te geven en eventueel te waarschuwen."}
@@ -1231,6 +1242,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
     plan = week_summary.get("plan") or {}
     next_2w = plan.get("next_2_weeks") or []
     roadmap = plan.get("roadmap") or []
+    plan_name = plan.get("plan_name") or None
     if next_2w:
         tr = []
         for row in next_2w:
@@ -1246,7 +1258,8 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         schema_html = (
             "<div class='card'>"
             "<h2>Schema (komende 2 weken)</h2>"
-            "<table>"
+            + (f"<div class='muted'>Bron: {esc(plan_name)}</div>" if plan_name else "")
+            + "<table>"
             "<thead><tr><th>Week</th><th>Training</th><th>Workout</th><th>Verandering</th><th>Waarom</th></tr></thead>"
             f"<tbody>{''.join(tr)}</tbody>"
             "</table>"
