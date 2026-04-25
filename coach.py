@@ -571,19 +571,28 @@ def coaching_from_timer_blocks(week_summary: dict) -> dict:
     if not run_blocks:
         return {"verdict": "onvoldoende data", "details": rd.get("streams_error"), "next_step": "Doe 3:00/2:00 × 6 op praattempo."}
 
-    run_hr = [float(b["avg_hr"]) for b in run_blocks if b.get("avg_hr") is not None]
+    # Prefer end-of-block HR (last ~60s average) over full-block average (HR ramps up after walking).
+    run_hr_end = [
+        float(b["hr_end_avg_60s"])
+        for b in run_blocks
+        if b.get("hr_end_avg_60s") is not None
+    ]
+    run_hr_avg = [float(b["avg_hr"]) for b in run_blocks if b.get("avg_hr") is not None]
     walk_drop = [float(b["hr_drop_60s"]) for b in walk_blocks if b.get("hr_drop_60s") is not None]
     run_drift = [float(b["hr_change"]) for b in run_blocks if b.get("hr_change") is not None]
 
     def avg(xs: list[float]) -> Optional[float]:
         return (sum(xs) / len(xs)) if xs else None
 
-    a_run_hr = avg(run_hr)
+    a_run_hr_end = avg(run_hr_end) if run_hr_end else None
+    a_run_hr = avg(run_hr_avg)
     a_drop = avg(walk_drop)
     a_drift = avg(run_drift)
 
     details = []
-    if a_run_hr is not None:
+    if a_run_hr_end is not None:
+        details.append(f"HR einde loopblokken (~laatste 60s): {int(round(a_run_hr_end))} bpm")
+    elif a_run_hr is not None:
         details.append(f"gem. HR loopblokken: {int(round(a_run_hr))} bpm")
     if a_drop is not None:
         details.append(f"HR↓60s (wandelblokken): {int(round(a_drop))} bpm")
@@ -591,9 +600,10 @@ def coaching_from_timer_blocks(week_summary: dict) -> dict:
         details.append(f"HRΔ (loopblokken): {int(round(a_drift))} bpm")
 
     # conservative heuristics for a beginner with city noise + strength training
-    too_hard = (a_run_hr is not None and a_run_hr >= 170) or (a_drift is not None and a_drift >= 55)
+    hr_guard = a_run_hr_end if a_run_hr_end is not None else a_run_hr
+    too_hard = (hr_guard is not None and hr_guard >= 170) or (a_drift is not None and a_drift >= 55)
     poor_recovery = (a_drop is not None and a_drop < 15)
-    good_recovery = (a_drop is not None and a_drop >= 25) and (a_run_hr is None or a_run_hr < 168)
+    good_recovery = (a_drop is not None and a_drop >= 25) and (hr_guard is None or hr_guard < 168)
 
     if too_hard or poor_recovery:
         verdict = "rustiger / consolideren"
@@ -772,6 +782,18 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
 
         hr_change = (hr_end - hr_start) if (hr_start is not None and hr_end is not None) else None
 
+        # Average HR over last ~60s of the block (more representative than avg when HR ramps up).
+        hr_end_avg_60s = None
+        if hr and hr_end is not None and idxs:
+            end_t = streams.time_s[idxs[-1]]
+            window_start_t = end_t - 60
+            tail_vals: list[int] = []
+            for ii in idxs:
+                if streams.time_s[ii] >= window_start_t and hr[ii] > 0:
+                    tail_vals.append(hr[ii])
+            if tail_vals:
+                hr_end_avg_60s = round(sum(tail_vals) / len(tail_vals), 1)
+
         hr_drop_60s = None
         if b.kind == "walk" and hr and hr_start is not None:
             # find index ~60s after block start within block
@@ -791,6 +813,7 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
                 "duration_s": block_duration(b),
                 "avg_pace_min_per_km": (round(avg_pace, 2) if avg_pace is not None else None),
                 "avg_hr": (round(avg_hr, 1) if avg_hr is not None else None),
+                "hr_end_avg_60s": hr_end_avg_60s,
                 "hr_change": hr_change,
                 "hr_drop_60s": hr_drop_60s,
             }
@@ -1213,7 +1236,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
                     f"<td><span class='pill'>{esc(b.get('kind'))}</span></td>"
                     f"<td class='mono'>{dur//60}:{dur%60:02d}</td>"
                     f"<td>{esc(fmt_pace(b.get('avg_pace_min_per_km')))}</td>"
-                    f"<td>{esc(b.get('avg_hr') or '—')}</td>"
+                    f"<td>{esc(b.get('avg_hr') or '—')}<div class='muted'>eind~60s: {esc(b.get('hr_end_avg_60s') or '—')}</div></td>"
                     f"<td>{esc(b.get('hr_change') if b.get('hr_change') is not None else '—')}</td>"
                     f"<td>{esc(b.get('hr_drop_60s') if b.get('hr_drop_60s') is not None else '—')}</td>"
                     "</tr>"
@@ -1286,6 +1309,30 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         "</div>"
     )
 
+    # Deterministic coaching summary (pace/effort guidance)
+    coach = plan.get("coach") or coaching_from_timer_blocks(week_summary)
+    verdict = str(coach.get("verdict") or "—")
+    details = str(coach.get("details") or "—")
+    next_step = str(coach.get("next_step") or "—")
+
+    vlow = verdict.lower()
+    if "rustiger" in vlow:
+        pace_tip = "Loop de loopblokken 10–20 sec/km rustiger dan vorige keer en hou strikt praattempo aan (niet ‘duwen’)."
+    elif "stabiel" in vlow:
+        pace_tip = "Je mag de laatste 1–2 loopblokken iets vlotter (±5–10 sec/km), zolang je HR niet wegloopt en je herstel goed blijft."
+    else:
+        pace_tip = "Hou het tempo gelijk en focus op ontspannen loopblokken. Versnellen pas als dit 2 weken stabiel blijft."
+
+    coaching_html = (
+        "<div class='card'>"
+        "<h2>Coachadvies (op basis van deze week)</h2>"
+        f"<div><b>Conclusie</b>: {esc(verdict)}</div>"
+        f"<div class='muted' style='margin-top:6px'>{esc(details)}</div>"
+        f"<div style='margin-top:10px'><b>Tempo-advies</b><br/>{esc(pace_tip)}</div>"
+        f"<div style='margin-top:10px'><b>Wat doe je volgende keer?</b><br/>{esc(next_step)}</div>"
+        "</div>"
+    )
+
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>{esc(subject)}</title>"
@@ -1295,6 +1342,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         + "</div>"
         f"{summary_table}"
         f"{''.join(blocks_html)}"
+        f"{coaching_html}"
         f"{schema_html}"
         f"{roadmap_html}"
         f"{coach_text_html}"
