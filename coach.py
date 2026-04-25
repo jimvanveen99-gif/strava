@@ -623,94 +623,86 @@ def coaching_from_timer_blocks(week_summary: dict) -> dict:
 
 def build_plan(week_summary: dict) -> dict:
     """
-    Build (1) next 2 weeks schedule and (2) a compact roadmap until race day.
+    Use Jim's fixed 16-week plan as source of truth.
+    The email shows the next 2 weeks + the delta vs last week.
     """
-    coach = coaching_from_timer_blocks(week_summary)
-    sug = coach.get("suggestion") or {"run_s": 180, "walk_s": 120, "reps": 6}
-    run_s = int(sug.get("run_s") or 180)
-    walk_s = int(sug.get("walk_s") or 120)
-    reps = int(sug.get("reps") or 6)
+    plan_weeks = {
+        1: {"t1": "3 min lopen / 2 min wandelen × 6", "t2": "20 min rustig hardlopen"},
+        2: {"t1": "3 min / 2 min × 7", "t2": "25 min rustig"},
+        3: {"t1": "4 min / 2 min × 5", "t2": "28 min rustig"},
+        4: {"t1": "5 min / 2 min × 4", "t2": "30 min rustig"},
+        5: {"t1": "8 min / 2 min × 3", "t2": "32 min rustig"},
+        6: {"t1": "10 min / 2 min × 3", "t2": "35 min rustig"},
+        7: {"t1": "12 min / 2 min × 2 + 8 min lopen", "t2": "38 min rustig"},
+        8: {"t1": "20 min aaneengesloten + 5 min extra", "t2": "40 min rustig"},
+        9: {"t1": "3 × 8 min op tempo (±6:15–6:20/km)", "t2": "45 min rustig"},
+        10: {"t1": "2 × 12 min op tempo", "t2": "50 min rustig"},
+        11: {"t1": "25 min steady (niet maximaal)", "t2": "55 min rustig"},
+        12: {"t1": "30 min aaneengesloten", "t2": "60 min rustig"},
+        13: {"t1": "3 × 10 min op 6:00–6:10/km", "t2": "60 min rustig"},
+        14: {"t1": "2 × 15 min op 6:00/km", "t2": "65 min rustig"},
+        15: {"t1": "25 min op 6:00/km", "t2": "45 min rustig"},
+        16: {"t1": "20 min relaxed", "t2": "RACE (10 km)"},
+    }
 
-    def fmt_interval(rs: int, ws: int, n: int) -> str:
-        return f"5–8 min warm-up wandelen/joggen, dan {rs//60}:{rs%60:02d} lopen / {ws//60}:{ws%60:02d} wandelen × {n}, 5–8 min uitwandelen."
+    # Week numbering: by default, treat the first week we run this as Week 1.
+    # You can pin it by setting TRAINING_PLAN_START_DATE=YYYY-MM-DD (Monday).
+    tz = ZoneInfo("Europe/Amsterdam") if ZoneInfo is not None else None
+    today = datetime.now(timezone.utc).astimezone(tz).date() if tz else datetime.now(timezone.utc).date()
+    start_env = _env("TRAINING_PLAN_START_DATE")
+    if start_env:
+        try:
+            start_date = datetime.fromisoformat(start_env).date()
+        except Exception:
+            start_date = today
+    else:
+        start_date = today  # week 1 anchored to "now" unless configured
+    week_idx = max(1, int(((today - start_date).days // 7) + 1))
 
-    # Base total time from latest run, so we don't jump too fast.
-    latest = _latest_run_with_timer(week_summary) or {}
-    base_total_s = int(latest.get("moving_time_s") or 0)
-    if base_total_s <= 0:
-        base_total_s = 30 * 60
-    # Conservative weekly increase in total time.
-    week1_total_s = min(base_total_s + 5 * 60, 38 * 60)
-    week2_total_s = min(week1_total_s + 5 * 60, 45 * 60)
-
-    next_2_weeks = [
-        {
-            "week": "Week 1",
-            "session": "Training A",
-            "when": "begin week (ma/di/wo)",
-            "workout": fmt_interval(run_s, walk_s, reps),
-            "delta": coach.get("delta_label") or "—",
-            "why": "Opbouw op basis van herstel/HR in je laatste run; doel is stabiele, comfortabele loopblokken.",
-        },
-        {
-            "week": "Week 1",
-            "session": "Training B",
-            "when": "weekend",
-            "workout": f"Easy run/walk op praattempo: {week1_total_s//60}–{(week1_total_s//60)+5} min totaal. Gebruik {run_s//60}:{run_s%60:02d}/{walk_s//60}:{walk_s%60:02d} als ‘cruise control’ (niet aaneengesloten forceren).",
-            "delta": f"+~5 min totaal t.o.v. deze week (conservatief)",
-            "why": "We bouwen vooral totale tijd rustig op; jij gaf aan dat 15–20 min aaneengesloten nog zwaar is, dus we blijven bewust bij run/walk.",
-        },
-        {
-            "week": "Week 2",
-            "session": "Training A",
-            "when": "begin week (ma/di/wo)",
-            "workout": fmt_interval(min(run_s + 30, 300), walk_s, reps) if coach.get("verdict") == "stabiel → kleine progressie" else fmt_interval(run_s, walk_s, reps),
-            "delta": "kleine stap (alleen als Week 1 goed voelde)",
-            "why": "Progressie alleen als HR en gevoel stabiel blijven; anders consolideren.",
-        },
-        {
-            "week": "Week 2",
-            "session": "Training B",
-            "when": "weekend",
-            "workout": f"Easy run/walk op praattempo: {week2_total_s//60}–{(week2_total_s//60)+5} min totaal. Optioneel: eindig met 4× 20s ‘vlotte pas’ (geen sprint) alleen als je fris bent.",
-            "delta": "+~5 min totaal (alleen als herstel goed is)",
-            "why": "Zelfde opbouwprincipe: tijd omhoog zonder ‘duwen’; korte vlotte passen helpen loopeconomie zonder hoge hartslag.",
-        },
-    ]
-
-    # Optional third session when recovery is good.
-    if coach.get("verdict") in {"stabiel → kleine progressie", "oké → nog 1 week vasthouden"}:
-        next_2_weeks.insert(
-            2,
+    def week_rows(w: int) -> list[dict]:
+        pw = plan_weeks.get(w)
+        if not pw:
+            return []
+        return [
             {
-                "week": "Week 1",
-                "session": "Training C (optioneel)",
-                "when": "midweek (alleen als je benen fris zijn)",
-                "workout": "20–25 min heel rustig (wandelen/joggen mix). Stop als je ‘duwt’ of pijntjes voelt.",
-                "delta": "extra prikkel (laag risico)",
-                "why": "Als je herstel goed is, helpt een korte extra sessie je basisconditie zonder veel belasting.",
+                "week": f"Week {w}",
+                "session": "Training 1",
+                "when": "begin week (ma/di/wo)",
+                "workout": pw["t1"],
             },
-        )
+            {
+                "week": f"Week {w}",
+                "session": "Training 2",
+                "when": "weekend",
+                "workout": pw["t2"],
+            },
+        ]
 
-    # Roadmap: very compact, week blocks towards race date.
-    race = week_summary.get("race_countdown") or {}
-    weeks_left = int(round(float(race.get("weeks") or 0))) if race.get("weeks") is not None else 0
-    weeks_left = max(0, weeks_left)
-    roadmap = []
-    for i in range(min(weeks_left, 16)):  # keep short
-        wk = i + 1
-        if wk <= 6:
-            focus = "Opbouw aaneengesloten lopen"
-            target = "meer looptijd per blok, HR stabiel"
-        elif wk <= 12:
-            focus = "Duur + lichte tempo-prikkels"
-            target = "richting 6:30–6:00/km stukken, zonder forceren"
-        else:
-            focus = "Specifieker richting 10 km"
-            target = "tempo-blokken + taper"
-        roadmap.append({"week": f"Week {wk}", "focus": focus, "target": target})
+    next_w1 = week_idx
+    next_w2 = min(16, week_idx + 1)
+    prev_w = max(1, week_idx - 1)
 
-    return {"coach": coach, "next_2_weeks": next_2_weeks, "roadmap": roadmap}
+    rows = week_rows(next_w1) + (week_rows(next_w2) if next_w2 != next_w1 else [])
+    prev = plan_weeks.get(prev_w) or {}
+    cur = plan_weeks.get(next_w1) or {}
+
+    delta_lines = []
+    if prev and cur:
+        if prev.get("t1") != cur.get("t1"):
+            delta_lines.append(f"Training 1: {prev.get('t1')} → {cur.get('t1')}")
+        if prev.get("t2") != cur.get("t2"):
+            delta_lines.append(f"Training 2: {prev.get('t2')} → {cur.get('t2')}")
+    delta_label = "\n".join(delta_lines) if delta_lines else "Geen verandering t.o.v. vorige week."
+
+    coach = coaching_from_timer_blocks(week_summary)
+    return {
+        "coach": coach,
+        "next_2_weeks": [
+            {**r, "delta": delta_label if r["week"] == f"Week {next_w1}" else "—", "why": "Plan volgens jouw 16-week schema; we gebruiken Strava-data alleen om tempo/HR-advies te geven en eventueel te waarschuwen."}
+            for r in rows
+        ],
+        "roadmap": [{"week": f"Week {i}", "focus": plan_weeks[i]["t1"], "target": plan_weeks[i]["t2"]} for i in range(1, 17)],
+    }
 
 
 def _avg(values: Optional[Union[list[float], list[int]]]) -> Optional[float]:
