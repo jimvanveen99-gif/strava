@@ -3,6 +3,7 @@ import os
 import smtplib
 import ssl
 import sys
+import argparse
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -405,7 +406,9 @@ def segment_blocks(
     i = 0
     while i < len(merged):
         b = merged[i]
-        if b.kind == "pause" and dur(b) <= 20:
+        # Stoplights in city running often show up as short "pause" blocks.
+        # Absorb these so the readable pattern becomes run/walk only.
+        if b.kind == "pause" and dur(b) <= 75:
             if cleaned:
                 prev = cleaned[-1]
                 cleaned[-1] = Block(kind=prev.kind, start_idx=prev.start_idx, end_idx_exclusive=b.end_idx_exclusive)
@@ -432,38 +435,28 @@ def blocks_to_readable_pattern(block_summaries: list[dict]) -> str:
     Turn blocks into a compact pattern string like:
     run 3:00 / walk 2:00 × 6 (approx)
     """
-    # Filter only run/walk/pause with meaningful duration
+    # Ignore pauses; we want a clear run/walk pattern even in city runs.
     filtered = [b for b in block_summaries if (b.get("duration_s") or 0) >= 20 and b.get("kind") in {"run", "walk"}]
     if len(filtered) < 2:
         return "n.v.t."
 
-    # Use the first run+walk pair as template
-    first_run = next((b for b in filtered if b["kind"] == "run"), None)
-    if not first_run:
+    run_durs = [int(b["duration_s"]) for b in filtered if b.get("kind") == "run"]
+    walk_durs = [int(b["duration_s"]) for b in filtered if b.get("kind") == "walk"]
+    if not run_durs:
         return "n.v.t."
-    run_dur = int(first_run["duration_s"])
-    # first walk after that
-    idx = filtered.index(first_run)
-    first_walk = next((b for b in filtered[idx + 1 :] if b["kind"] == "walk"), None)
-    if not first_walk:
+
+    def _median_int(xs: list[int]) -> int:
+        ys = sorted(xs)
+        return int(ys[len(ys) // 2])
+
+    run_dur = _median_int(run_durs)
+    walk_dur = _median_int(walk_durs) if walk_durs else 0
+    # Estimate repetitions by counting run blocks (more robust than exact matching).
+    reps = min(len(run_durs), len(walk_durs)) if walk_durs else len(run_durs)
+
+    if not walk_durs:
         return f"run {run_dur//60}:{run_dur%60:02d} (aaneengesloten/blokken)"
-    walk_dur = int(first_walk["duration_s"])
-
-    # Count pairs by scanning for run->walk transitions that roughly match durations (+/-40s)
-    def close(a: int, b: int) -> bool:
-        return abs(a - b) <= 40
-
-    pairs = 0
-    i = 0
-    while i < len(filtered) - 1:
-        if filtered[i]["kind"] == "run" and filtered[i + 1]["kind"] == "walk":
-            if close(int(filtered[i]["duration_s"]), run_dur) and close(int(filtered[i + 1]["duration_s"]), walk_dur):
-                pairs += 1
-                i += 2
-                continue
-        i += 1
-
-    return f"run {run_dur//60}:{run_dur%60:02d} / walk {walk_dur//60}:{walk_dur%60:02d} × {max(1, pairs)} (geschat)"
+    return f"run {run_dur//60}:{run_dur%60:02d} / walk {walk_dur//60}:{walk_dur%60:02d} × {max(1, reps)} (geschat)"
 
 
 def _avg(values: list[float] | list[int] | None) -> float | None:
@@ -500,6 +493,12 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
         avg_vel = _avg(vel_vals)
         avg_pace = _pace_from_velocity(avg_vel) if avg_vel is not None else None
         avg_hr = _avg(hr_vals) if hr_vals else None
+
+        # Guardrail: in city runs and around manual pauses, a "pause" block can still
+        # contain non-zero velocity samples (GPS/stream noise). Don't report a "pause"
+        # as if it had a meaningful running pace.
+        if b.kind == "pause":
+            avg_pace = None
 
         hr_start = None
         hr_end = None
@@ -691,18 +690,53 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
 
     model = _env("OPENAI_MODEL", "gpt-4o-mini")
 
+    athlete_profile = {
+        "age_years": 26,
+        "weight_kg": 90,
+        "training_frequency_runs_per_week": 2,
+        "strength_training_per_week": 4,
+        "experience": "beginner (run/walk opbouw)",
+        "environment": "stad (Hilversum centrum) met stoplichten/verkeer/hobbels; tempo (pace) is daardoor minder betrouwbaar",
+        "preferences": {
+            "preferred_days": ["ma/di/wo (begin week)", "weekend"],
+        },
+        "recent_notes_from_athlete": [
+            "20 min aaneengesloten op ~6:17/km voelde moeizaam/te hard",
+            "15 min aaneengesloten op 6:15–6:30/km komt vaak in HR ~170+ bpm",
+            "3 min lopen / 2 min wandelen × 6 rond HR ~160 bpm voelde stabiel en ging (erg) goed",
+        ],
+    }
+
     system = (
         "Je bent een Nederlandse AI hardloopcoach. Je schrijft concreet en praktisch, als een persoonlijke coach. "
-        "Je maakt altijd een schema voor 2 weken vooruit met 2 trainingen per week. "
-        "De loper is beginner, traint 2x per week, komt van run/walk intervallen en traint daarnaast 4x per week kracht. "
+        "Je maakt altijd een schema voor 2 weken vooruit met 2 trainingen per week (4 trainingen totaal), volledig uitgeschreven. "
+        "Je coacht conservatief (blessurepreventie) maar doelgericht. "
+        "De loper is beginner en bouwt op via run/walk intervallen, traint daarnaast 4x per week kracht en wil primair conditie opbouwen. "
+        "Context: de loper loopt vaak in de stad met stoplichten; daarom is pace minder betrouwbaar. Stuur primair op RPE/praattempo en hartslag, "
+        "en gebruik pace alleen als indicatie. "
         "Doel: 10 km Singelloop Utrecht op 4 okt 2026 < 60 min (6:00/km), maar eerst veilig 10 km aaneengesloten kunnen lopen. "
-        "Je baseert je analyse vooral op de intervalblokken uit runs_detailed (tempo + HR per blok), niet op de totale gemiddelden van de run."
+        "Je baseert je analyse vooral op de intervalblokken uit runs_detailed (tempo + HR per blok) en herstel-indicatoren (HRΔ en HR↓60s), "
+        "niet op de totale gemiddelden van de run. "
+        "Je houdt rekening met ruis (stoplichten/pauzes): overweeg dan trends per blok i.p.v. 1 uitschieter."
     )
+
+    # Try to infer the most recent interval pattern from detailed runs.
+    inferred_baseline = None
+    try:
+        rd = list(week_summary.get("runs_detailed") or [])
+        rd_sorted = sorted([x for x in rd if isinstance(x, dict)], key=lambda x: str(x.get("date") or ""))
+        last_with_pattern = next((x for x in reversed(rd_sorted) if (x.get("pattern_estimate") or "n.v.t.") != "n.v.t."), None)
+        if last_with_pattern:
+            inferred_baseline = str(last_with_pattern.get("pattern_estimate") or "").strip() or None
+    except Exception:
+        inferred_baseline = None
 
     user = {
         "week_summary": week_summary,
         "runs_detailed": week_summary.get("runs_detailed"),
-        "current_baseline": "3 min hardlopen / 2 min wandelen × 6 voelde haalbaar (laatste bekende training).",
+        "athlete_profile": athlete_profile,
+        "current_baseline": "3 min lopen / 2 min wandelen × 6 rond ~160 bpm voelt stabiel en goed (laatste bekende training).",
+        "inferred_recent_pattern_from_strava": inferred_baseline,
         "race": {
             "name": "Singelloop Utrecht 10 km",
             "date": "2026-10-04",
@@ -718,10 +752,12 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
             "Bouw geleidelijk op (beginner, blessurepreventie).",
             "Geen algemene tips, maar specifiek advies op basis van de weekdata.",
             "Gebruik vooral de blokken (run vs walk) uit runs_detailed om advies te geven over harder/zachter lopen en interval-opbouw.",
-            "Tempo-indicaties in RPE/praattempo en (als mogelijk) min/km richting 6:00, maar niet forceren.",
-            "Als HR in loopblokken snel oploopt of herstel in wandelblokken slecht is (HR zakt weinig), adviseer rustiger lopen of dezelfde interval nog een week herhalen.",
-            "Als pace in loopblokken stabiel is en herstel goed is (HR daalt duidelijk binnen 60–90 sec), adviseer een kleine progressie: +30–60 sec lopen per blok of -15–30 sec wandelen.",
+            "Tempo-indicaties primair in RPE/praattempo; HR als guardrail; pace (min/km) alleen als ruwe indicatie (stad/stoplichten).",
+            "Gebruik voor beslissingen vooral: HRΔ per loopblok, HR↓60s in wandelblokken, en stabiliteit van pace/HR over meerdere blokken.",
+            "Als HR in loopblokken oploopt richting ~170+ of herstel in wandelblokken slecht is (HR↓60s klein), adviseer rustiger lopen of dezelfde interval nog 1–2 weken herhalen.",
+            "Als loopblokken stabiel aanvoelen en herstel goed is (HR daalt duidelijk binnen 60–90 sec), adviseer een kleine progressie: +30–60 sec lopen per blok of -15–30 sec wandelen.",
             "Houd rekening met 4x per week sportschool: liever iets te rustig dan te agressief opbouwen.",
+            "Plan bij voorkeur 1 training begin van de week (ma/di/wo) en 1 in het weekend, met minimaal 48 uur tussen zware beentraining en een run.",
         ],
     }
 
@@ -889,6 +925,8 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
 
         rows = []
         for b in blocks[:18]:
+            if b.get("kind") == "pause":
+                continue
             dur = int(b.get("duration_s") or 0)
             rows.append(
                 "<tr>"
@@ -1030,6 +1068,72 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
         server.sendmail(gmail_user, [mail_to], msg.as_string())
 
 
+def write_preview(subject: str, body: str, week_summary: dict, *, out_dir: str = "preview") -> str:
+    """
+    Write a local HTML preview + PNG charts to disk.
+    Returns the path to the HTML file.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    runs_detailed = week_summary.get("runs_detailed") or []
+    images: list[tuple[str, bytes]] = []
+    for rd in runs_detailed[:3]:
+        rid = rd.get("id")
+        series = rd.get("series")
+        if not rid or not series:
+            continue
+        pace_png = _plot_series_png(series, kind="pace")
+        hr_png = _plot_series_png(series, kind="hr")
+        if pace_png:
+            images.append((f"run{rid}-pace.png", pace_png))
+        if hr_png:
+            images.append((f"run{rid}-hr.png", hr_png))
+
+    for name, data in images:
+        with open(os.path.join(out_dir, name), "wb") as f:
+            f.write(data)
+
+    # Build a simple HTML that references local PNGs (not cid:).
+    blocks = []
+    for rd in runs_detailed[:3]:
+        rid = rd.get("id")
+        if not rid:
+            continue
+        imgs = []
+        p = os.path.join(out_dir, f"run{rid}-pace.png")
+        h = os.path.join(out_dir, f"run{rid}-hr.png")
+        if os.path.exists(p):
+            imgs.append(f"<div><div style='color:#666;font-size:12px'>Tempo</div><img style='max-width:100%;height:auto' src='{html.escape(os.path.basename(p))}' /></div>")
+        if os.path.exists(h):
+            imgs.append(f"<div><div style='color:#666;font-size:12px'>Hartslag</div><img style='max-width:100%;height:auto' src='{html.escape(os.path.basename(h))}' /></div>")
+        if imgs:
+            blocks.append(
+                "<div style='border:1px solid #e5e5e5;border-radius:10px;padding:12px 14px;margin:12px 0'>"
+                f"<div style='font-weight:600;margin-bottom:6px'>Preview grafieken {html.escape(str(rd.get('date') or ''))}</div>"
+                + "<div style='display:grid;gap:12px;grid-template-columns:1fr'>"
+                + "".join(imgs)
+                + "</div></div>"
+            )
+
+    preview_html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>{html.escape(subject)}</title>"
+        "</head><body style='font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;color:#111'>"
+        f"<div style='color:#555;font-size:13px;margin-bottom:12px'>{html.escape(subject)}</div>"
+        + "".join(blocks)
+        + "<div style='border:1px solid #e5e5e5;border-radius:10px;padding:12px 14px;margin:12px 0'>"
+        "<div style='font-weight:600;margin-bottom:6px'>Coachbericht (plain text)</div>"
+        f"<pre style='white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px'>{html.escape(body)}</pre>"
+        "</div>"
+        "</body></html>"
+    )
+
+    html_path = os.path.join(out_dir, "preview.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(preview_html)
+    return html_path
+
+
 def _plot_series_png(series: dict, *, kind: str) -> bytes | None:
     """
     Render a lightweight PNG chart for email (pace or hr).
@@ -1088,6 +1192,27 @@ def _plot_series_png(series: dict, *, kind: str) -> bytes | None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Weekly Singelloop Coach")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate coach output and print to stdout (no email).",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Write preview HTML + charts to ./preview (no email).",
+    )
+    parser.add_argument(
+        "--force-send",
+        action="store_true",
+        help="Ignore Sunday 22:00 Europe/Amsterdam gate (useful for testing).",
+    )
+    args = parser.parse_args()
+
+    if args.force_send:
+        os.environ["FORCE_SEND"] = "true"
+
     now_utc = datetime.now(timezone.utc)
     if not should_send_now(now_utc):
         print("Not Sunday 22:00 Europe/Amsterdam. Exiting without sending.")
@@ -1112,6 +1237,16 @@ def main() -> int:
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
     subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()})"
+    if args.dry_run:
+        print(subject)
+        print("")
+        print(body)
+        return 0
+    if args.preview:
+        path = write_preview(subject, body, week_summary)
+        print(f"Preview written: {path}")
+        return 0
+
     send_email(subject, body, week_summary)
     print("Email sent.")
     return 0
