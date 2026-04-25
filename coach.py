@@ -964,6 +964,8 @@ def fallback_email(week_summary: dict) -> str:
 def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline_cids: dict[str, str]) -> str:
     runs = week_summary.get("runs") or []
     runs_detailed = week_summary.get("runs_detailed") or []
+    build = week_summary.get("build_info") or {}
+    build_label = build.get("label") or None
 
     def esc(s: object) -> str:
         return html.escape("" if s is None else str(s))
@@ -1127,7 +1129,9 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
         "<!doctype html><html><head><meta charset='utf-8'>"
         f"<title>{esc(subject)}</title>"
         f"<style>{css}</style></head><body>"
-        f"<div class='meta'>{esc(subject)}</div>"
+        f"<div class='meta'>{esc(subject)}"
+        + (f" — <span class='muted'>build {esc(build_label)}</span>" if build_label else "")
+        + "</div>"
         f"{summary_table}"
         f"{''.join(blocks_html)}"
         f"{schema_html}"
@@ -1477,6 +1481,10 @@ def main() -> int:
     runs = [a for a in acts if is_running_activity(a)]
     week_summary = build_week_summary(runs)
     week_summary["runs_detailed"] = build_week_detailed(access_token, runs)
+    # Add a build/version label so it's obvious whether GitHub is running the latest code.
+    sha = _env("GITHUB_SHA")
+    build_label = (sha[:7] if sha else None) or now_utc.strftime("%Y%m%d-%H%M")
+    week_summary["build_info"] = {"label": build_label}
     # Add race countdown for the LLM / email.
     try:
         if ZoneInfo is not None:
@@ -1489,7 +1497,7 @@ def main() -> int:
         pass
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
-    subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()})"
+    subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()}) [{build_label}]"
     if args.dry_run:
         print(subject)
         print("")
