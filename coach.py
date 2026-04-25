@@ -1259,7 +1259,7 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline
             "<div class='card'>"
             "<h2>Schema (komende 2 weken)</h2>"
             + (f"<div class='muted'>Bron: {esc(plan_name)}</div>" if plan_name else "")
-            "<table>"
+            + "<table>"
             "<thead><tr><th>Week</th><th>Training</th><th>Workout</th><th>Verandering</th><th>Waarom</th></tr></thead>"
             f"<tbody>{''.join(tr)}</tbody>"
             "</table>"
