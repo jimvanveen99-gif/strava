@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import html
+import io
+from email.mime.image import MIMEImage
 
 try:
     from zoneinfo import ZoneInfo  # py>=3.9
@@ -291,11 +293,17 @@ def segment_blocks(
 
     def _rolling_median(values: list[float | None]) -> list[float | None]:
         out: list[float | None] = [None] * len(values)
-        w = max(1, smooth_window_seconds)
+        w = max(5, smooth_window_seconds)
         for i in range(len(values)):
-            # window by index (streams are ~1Hz; good enough for our use)
-            start = max(0, i - w)
-            end = min(len(values), i + w + 1)
+            # window by TIME, not by index (streams can be irregular)
+            t0 = streams.time_s[i] - w
+            t1 = streams.time_s[i] + w
+            start = i
+            while start > 0 and streams.time_s[start - 1] >= t0:
+                start -= 1
+            end = i + 1
+            while end < len(values) and streams.time_s[end] <= t1:
+                end += 1
             window = [x for x in values[start:end] if x is not None]
             if not window:
                 out[i] = None
@@ -386,7 +394,37 @@ def segment_blocks(
             merged[-1] = Block(kind=prev.kind, start_idx=prev.start_idx, end_idx_exclusive=b.end_idx_exclusive)
         else:
             merged.append(b)
-    return merged
+
+    # absorb very short pauses (e.g. a stoplight) into neighboring block
+    def dur(b: Block) -> int:
+        if b.end_idx_exclusive <= b.start_idx + 1:
+            return 0
+        return int(streams.time_s[b.end_idx_exclusive - 1] - streams.time_s[b.start_idx] + 1)
+
+    cleaned: list[Block] = []
+    i = 0
+    while i < len(merged):
+        b = merged[i]
+        if b.kind == "pause" and dur(b) <= 20:
+            if cleaned:
+                prev = cleaned[-1]
+                cleaned[-1] = Block(kind=prev.kind, start_idx=prev.start_idx, end_idx_exclusive=b.end_idx_exclusive)
+            elif i + 1 < len(merged):
+                nxt = merged[i + 1]
+                merged[i + 1] = Block(kind=nxt.kind, start_idx=b.start_idx, end_idx_exclusive=nxt.end_idx_exclusive)
+            i += 1
+            continue
+        cleaned.append(b)
+        i += 1
+
+    final: list[Block] = []
+    for b in cleaned:
+        if final and final[-1].kind == b.kind and final[-1].end_idx_exclusive == b.start_idx:
+            prev = final[-1]
+            final[-1] = Block(kind=prev.kind, start_idx=prev.start_idx, end_idx_exclusive=b.end_idx_exclusive)
+        else:
+            final.append(b)
+    return final
 
 
 def blocks_to_readable_pattern(block_summaries: list[dict]) -> str:
@@ -452,7 +490,7 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
     def block_duration(b: Block) -> int:
         if b.end_idx_exclusive <= b.start_idx + 1:
             return 0
-        return int(streams.time_s[b.end_idx_exclusive - 1] - streams.time_s[b.start_idx])
+        return int(streams.time_s[b.end_idx_exclusive - 1] - streams.time_s[b.start_idx] + 1)
 
     for b in blocks:
         idxs = list(range(b.start_idx, b.end_idx_exclusive))
@@ -579,10 +617,13 @@ def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
             blocks = segment_blocks(streams)
             block_summaries = summarize_blocks(streams, blocks)
             pattern = blocks_to_readable_pattern(block_summaries)
+            # Store a downsampled series for plotting (keep small).
+            series = _downsample_series_for_chart(streams)
         except Exception as e:
             block_summaries = []
             pattern = "n.v.t."
             err = str(e)
+            series = None
         else:
             err = None
 
@@ -598,10 +639,49 @@ def build_week_detailed(access_token: str, runs: list[Activity]) -> list[dict]:
                 "avg_hr": a.average_heartrate,
                 "pattern_estimate": pattern,
                 "blocks": block_summaries,
+                "series": series,
                 "streams_error": err,
             }
         )
     return detailed
+
+
+def _downsample_series_for_chart(streams: Streams, max_points: int = 240) -> dict | None:
+    """
+    Prepare a small (time, pace, hr) series for charting in email.
+    Returns dict with minutes + values (some may be None).
+    """
+    if not streams.time_s:
+        return None
+
+    n = len(streams.time_s)
+    step = max(1, n // max_points)
+
+    minutes: list[float] = []
+    pace: list[float | None] = []
+    hr: list[int | None] = []
+
+    vel = streams.velocity_mps
+    hrv = streams.heartrate_bpm
+
+    for i in range(0, n, step):
+        t = streams.time_s[i] / 60.0
+        minutes.append(round(t, 3))
+        if vel is not None:
+            p = _pace_from_velocity(vel[i])
+            pace.append(p if (p is None or 2.5 <= p <= 20.0) else None)
+        else:
+            pace.append(None)
+        if hrv is not None:
+            v = hrv[i]
+            hr.append(v if v > 0 else None)
+        else:
+            hr.append(None)
+
+    # If both are empty, don't bother.
+    if all(x is None for x in pace) and all(x is None for x in hr):
+        return None
+    return {"minutes": minutes, "pace_min_per_km": pace, "hr_bpm": hr}
 
 
 def openai_generate_coach_email(week_summary: dict) -> str | None:
@@ -737,7 +817,7 @@ def fallback_email(week_summary: dict) -> str:
     return "\n".join(lines)
 
 
-def _render_html_email(subject: str, plain_text: str, week_summary: dict) -> str:
+def _render_html_email(subject: str, plain_text: str, week_summary: dict, inline_cids: dict[str, str]) -> str:
     runs = week_summary.get("runs") or []
     runs_detailed = week_summary.get("runs_detailed") or []
 
@@ -781,15 +861,27 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict) -> str
         "</div>"
     )
 
-    # Block tables per run (first ~2 runs to keep email readable)
+    # Block tables + charts per run (first few runs to keep email readable)
     blocks_html = []
     for rd in runs_detailed[:3]:
         blocks = rd.get("blocks") or []
+        chart_html = ""
+        cid_pace = inline_cids.get(f"{rd.get('id')}:pace")
+        cid_hr = inline_cids.get(f"{rd.get('id')}:hr")
+        if cid_pace or cid_hr:
+            imgs = []
+            if cid_pace:
+                imgs.append(f"<div><div class='muted'>Tempo</div><img alt='Tempo' style='max-width:100%; height:auto;' src='cid:{esc(cid_pace)}' /></div>")
+            if cid_hr:
+                imgs.append(f"<div><div class='muted'>Hartslag</div><img alt='Hartslag' style='max-width:100%; height:auto;' src='cid:{esc(cid_hr)}' /></div>")
+            chart_html = "<div style='display:grid; gap:12px; grid-template-columns:1fr;'>" + "".join(imgs) + "</div>"
+
         header = (
             f"<div class='card'>"
             f"<h2>Intervalblokken {esc(rd.get('date'))}</h2>"
             f"<div class='meta'>{esc(rd.get('name'))} — {esc(rd.get('distance_km'))} km — patroon: "
             f"<span class='pill'>{esc(rd.get('pattern_estimate'))}</span></div>"
+            f"{chart_html}"
         )
         if rd.get("streams_error"):
             blocks_html.append(header + f"<div class='muted'>Streams niet beschikbaar: {esc(rd.get('streams_error'))}</div></div>")
@@ -826,12 +918,46 @@ def _render_html_email(subject: str, plain_text: str, week_summary: dict) -> str
         before, after = plain_text.split(marker, 1)
         coach_text_only = before.strip()
         schema_text = (marker + after).strip()
-        schema_html = (
-            "<div class='card'>"
-            "<h2>Schema</h2>"
-            f"<div class='mono'>{esc(schema_text)}</div>"
-            "</div>"
-        )
+        # Try to render as a simple table (Week/Training/Content) if it looks structured.
+        lines = [ln.strip() for ln in schema_text.splitlines() if ln.strip()]
+        rows = []
+        cur_week = ""
+        for ln in lines:
+            if ln.lower().startswith("week"):
+                cur_week = ln
+                continue
+            if ln.lower().startswith("training"):
+                rows.append((cur_week, ln, ""))
+                continue
+            if rows:
+                w, t, c = rows[-1]
+                rows[-1] = (w, t, (c + ("\n" if c else "") + ln))
+        if rows:
+            tr = []
+            for w, t, c in rows:
+                tr.append(
+                    "<tr>"
+                    f"<td>{esc(w or '—')}</td>"
+                    f"<td><b>{esc(t)}</b></td>"
+                    f"<td class='mono'>{esc(c)}</td>"
+                    "</tr>"
+                )
+            schema_html = (
+                "<div class='card'>"
+                "<h2>Schema (2 weken)</h2>"
+                "<table>"
+                "<thead><tr><th>Week</th><th>Training</th><th>Instructies</th></tr></thead>"
+                f"<tbody>{''.join(tr)}</tbody>"
+                "</table>"
+                "</div>"
+            )
+        else:
+            schema_html = (
+                "<div class='card'>"
+                "<h2>Schema</h2>"
+                f"<div class='mono'>{esc(schema_text)}</div>"
+                "</div>"
+            )
 
     coach_text_html = (
         "<div class='card'>"
@@ -859,22 +985,106 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
     if not gmail_user or not gmail_app_password or not mail_to:
         raise SystemExit("Missing GMAIL_USER / GMAIL_APP_PASSWORD / MAIL_TO env vars.")
 
-    # Always send multipart (plain + html) so it looks nice but stays compatible.
-    msg = MIMEMultipart("alternative")
+    # We send a multipart/related container so we can embed inline PNG charts,
+    # with a nested multipart/alternative (plain + html).
+    msg = MIMEMultipart("related")
     msg["From"] = gmail_user
     msg["To"] = mail_to
     msg["Subject"] = subject
 
-    plain_part = MIMEText(body, "plain", "utf-8")
-    html_body = _render_html_email(subject, body, week_summary)
-    html_part = MIMEText(html_body, "html", "utf-8")
-    msg.attach(plain_part)
-    msg.attach(html_part)
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(body, "plain", "utf-8"))
+
+    # Build inline charts (PNG) for first few runs.
+    inline_cids: dict[str, str] = {}
+    images: list[tuple[str, bytes]] = []
+    for rd in (week_summary.get("runs_detailed") or [])[:3]:
+        rid = rd.get("id")
+        series = rd.get("series")
+        if not rid or not series:
+            continue
+        pace_png = _plot_series_png(series, kind="pace")
+        hr_png = _plot_series_png(series, kind="hr")
+        if pace_png:
+            cid = f"run{rid}-pace"
+            inline_cids[f"{rid}:pace"] = cid
+            images.append((cid, pace_png))
+        if hr_png:
+            cid = f"run{rid}-hr"
+            inline_cids[f"{rid}:hr"] = cid
+            images.append((cid, hr_png))
+
+    html_body = _render_html_email(subject, body, week_summary, inline_cids)
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(alt)
+
+    for cid, data in images:
+        img = MIMEImage(data, _subtype="png")
+        img.add_header("Content-ID", f"<{cid}>")
+        img.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
+        msg.attach(img)
 
     context = ssl.create_default_context()
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
         server.login(gmail_user, gmail_app_password)
         server.sendmail(gmail_user, [mail_to], msg.as_string())
+
+
+def _plot_series_png(series: dict, *, kind: str) -> bytes | None:
+    """
+    Render a lightweight PNG chart for email (pace or hr).
+    Uses matplotlib if available; returns PNG bytes.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+
+    x = series.get("minutes") or []
+    if not x:
+        return None
+
+    if kind == "pace":
+        y = series.get("pace_min_per_km") or []
+        title = "Tempo (min/km)"
+        color = "#2563eb"
+    elif kind == "hr":
+        y = series.get("hr_bpm") or []
+        title = "Hartslag (bpm)"
+        color = "#dc2626"
+    else:
+        return None
+
+    # Convert None to gaps
+    xs: list[float] = []
+    ys: list[float] = []
+    for xi, yi in zip(x, y):
+        if yi is None:
+            xs.append(float("nan"))
+            ys.append(float("nan"))
+        else:
+            xs.append(float(xi))
+            ys.append(float(yi))
+
+    fig, ax = plt.subplots(figsize=(7.2, 2.2), dpi=140)
+    ax.plot(xs, ys, linewidth=1.6, color=color)
+    ax.set_title(title, fontsize=10, loc="left")
+    ax.set_xlabel("min", fontsize=8)
+    ax.grid(True, alpha=0.18)
+    ax.tick_params(axis="both", labelsize=8)
+
+    # Pace chart: invert y so faster (lower) is higher up
+    if kind == "pace":
+        ax.invert_yaxis()
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
 
 
 def main() -> int:
