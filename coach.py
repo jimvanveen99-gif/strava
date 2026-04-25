@@ -2,6 +2,8 @@ import json
 import os
 import smtplib
 import ssl
+import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -164,6 +166,7 @@ def fetch_streams(access_token: str, activity_id: int) -> Streams:
     if not time_data:
         raise RuntimeError(f"Strava streams missing 'time' for activity {activity_id}: {raw}")
 
+    # Ensure ints
     time_s: list[int] = []
     for x in time_data:
         try:
@@ -195,7 +198,7 @@ def fetch_streams(access_token: str, activity_id: int) -> Streams:
                 vel_out.append(0.0)
         velocity_mps = vel_out if vel_out else None
 
-    # align lengths
+    # Strava streams are usually aligned; if not, we truncate to min length.
     n = len(time_s)
     if heartrate_bpm is not None:
         n = min(n, len(heartrate_bpm))
@@ -211,6 +214,7 @@ def fetch_streams(access_token: str, activity_id: int) -> Streams:
 
 
 def is_running_activity(a: Activity) -> bool:
+    # Strava types vary; "Run" is typical. Keep flexible.
     return a.type.lower() in {"run", "trailrun", "virtualrun"}
 
 
@@ -238,6 +242,7 @@ def fmt_pace(p: float | None) -> str:
 
 
 def classify_run(a: Activity) -> str:
+    # Lightweight heuristic: if elapsed >> moving, there were substantial pauses -> likely run/walk or intervals.
     if a.moving_time_s <= 0:
         return "onbekend"
     ratio = a.elapsed_time_s / a.moving_time_s if a.elapsed_time_s else 1.0
@@ -257,12 +262,18 @@ def segment_blocks(
     pause_velocity_mps: float = 0.3,
     min_block_seconds: int = 25,
 ) -> list[Block]:
+    """
+    Segment a run into run/walk/pause blocks from streams.
+    Uses velocity_smooth when available; otherwise falls back to pause detection only.
+    Adds a minimum block duration to avoid rapid flipping due to noise.
+    """
     n = len(streams.time_s)
     if n == 0:
         return []
 
     vel = streams.velocity_mps
     if vel is None:
+        # Can't reliably segment run vs walk; return one unknown-ish run block.
         return [Block(kind="run", start_idx=0, end_idx_exclusive=n)]
 
     def kind_at(i: int) -> str:
@@ -290,8 +301,10 @@ def segment_blocks(
             i += 1
             continue
 
+        # candidate boundary at i
         cur_dur = duration_seconds(cur_start, i)
         if cur_dur < min_block_seconds:
+            # too short: treat as noise; keep current kind
             i += 1
             continue
 
@@ -300,9 +313,11 @@ def segment_blocks(
         cur_start = i
         i += 1
 
+    # finalize
     if duration_seconds(cur_start, n) >= 1:
         blocks.append(Block(kind=cur_kind, start_idx=cur_start, end_idx_exclusive=n))
 
+    # merge adjacent same-kind blocks (can happen due to noise suppression)
     merged: list[Block] = []
     for b in blocks:
         if merged and merged[-1].kind == b.kind and merged[-1].end_idx_exclusive == b.start_idx:
@@ -314,20 +329,28 @@ def segment_blocks(
 
 
 def blocks_to_readable_pattern(block_summaries: list[dict]) -> str:
+    """
+    Turn blocks into a compact pattern string like:
+    run 3:00 / walk 2:00 × 6 (approx)
+    """
+    # Filter only run/walk/pause with meaningful duration
     filtered = [b for b in block_summaries if (b.get("duration_s") or 0) >= 20 and b.get("kind") in {"run", "walk"}]
     if len(filtered) < 2:
         return "n.v.t."
 
+    # Use the first run+walk pair as template
     first_run = next((b for b in filtered if b["kind"] == "run"), None)
     if not first_run:
         return "n.v.t."
     run_dur = int(first_run["duration_s"])
+    # first walk after that
     idx = filtered.index(first_run)
     first_walk = next((b for b in filtered[idx + 1 :] if b["kind"] == "walk"), None)
     if not first_walk:
         return f"run {run_dur//60}:{run_dur%60:02d} (aaneengesloten/blokken)"
     walk_dur = int(first_walk["duration_s"])
 
+    # Count pairs by scanning for run->walk transitions that roughly match durations (+/-40s)
     def close(a: int, b: int) -> bool:
         return abs(a - b) <= 40
 
@@ -353,6 +376,14 @@ def _avg(values: list[float] | list[int] | None) -> float | None:
 
 
 def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
+    """
+    Compute block-level metrics for email/LLM:
+    - duration
+    - avg pace (if velocity available)
+    - avg HR (if HR available)
+    - HR change within block (end-start)
+    - For walk blocks: HR drop over first 60 seconds (if possible)
+    """
     out: list[dict] = []
     hr = streams.heartrate_bpm
     vel = streams.velocity_mps
@@ -374,6 +405,7 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
         hr_start = None
         hr_end = None
         if hr_vals and hr:
+            # first/last non-zero within block
             for i in idxs:
                 if hr[i] > 0:
                     hr_start = hr[i]
@@ -387,6 +419,7 @@ def summarize_blocks(streams: Streams, blocks: list[Block]) -> list[dict]:
 
         hr_drop_60s = None
         if b.kind == "walk" and hr and hr_start is not None:
+            # find index ~60s after block start within block
             start_t = streams.time_s[b.start_idx]
             target_t = start_t + 60
             j = None
@@ -420,6 +453,7 @@ def week_range_amsterdam(now_utc: datetime) -> tuple[datetime, datetime, datetim
 
     tz = ZoneInfo("Europe/Amsterdam")
     now_local = now_utc.astimezone(tz)
+    # find start of current week (Mon)
     week_start_local = (now_local - timedelta(days=now_local.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -566,8 +600,20 @@ def openai_generate_coach_email(week_summary: dict) -> str | None:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        # e.g. 429 Too Many Requests (rate limit / quota). Fall back to deterministic email.
+        try:
+            detail = e.read().decode("utf-8")
+        except Exception:
+            detail = ""
+        print(f"OpenAI HTTPError {e.code}. Falling back. {detail[:500]}")
+        return None
+    except Exception as e:  # pragma: no cover
+        print(f"OpenAI request failed. Falling back. {e}")
+        return None
 
     try:
         return str(data["choices"][0]["message"]["content"]).strip()
@@ -602,9 +648,10 @@ def fallback_email(week_summary: dict) -> str:
                 if rd.get("streams_error"):
                     lines.append(f"  - streams niet beschikbaar: {rd['streams_error']}")
                     continue
+                # Show first few blocks only
                 blocks = rd.get("blocks") or []
                 for b in blocks[:10]:
-                    dur = int(b.get("duration_s") or 0)
+                    dur = int(b.get('duration_s') or 0)
                     lines.append(
                         f"  - {b.get('kind')}: {dur//60}:{dur%60:02d}, pace {fmt_pace(b.get('avg_pace_min_per_km'))}, HR {b.get('avg_hr')}, HRΔ {b.get('hr_change')}, HR↓60s {b.get('hr_drop_60s')}"
                     )
@@ -660,10 +707,7 @@ def main() -> int:
     week_summary["runs_detailed"] = build_week_detailed(access_token, runs)
 
     body = openai_generate_coach_email(week_summary) or fallback_email(week_summary)
-    subject = (
-        f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–"
-        f"{(week_end_local.date() - timedelta(days=1)).isoformat()})"
-    )
+    subject = f"Hardloopcoach weekplan ({week_start_local.date().isoformat()}–{(week_end_local.date() - timedelta(days=1)).isoformat()})"
     send_email(subject, body)
     print("Email sent.")
     return 0
@@ -671,3 +715,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
