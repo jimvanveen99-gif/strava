@@ -5,11 +5,18 @@ on:
     # GitHub schedules are UTC. We run at 19/20/21 UTC on Sundays and the script
     # only sends when local time is Sunday 22:00 in Europe/Amsterdam (covers DST).
     - cron: "0 19,20,21 * * 0"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: "Send now (ignore Sunday 22:00 gate)"
+        required: false
+        type: boolean
 
 jobs:
   coach:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,5 +36,6 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          FORCE_SEND: ${{ inputs.force_send }}
         run: |
           python coach.py
