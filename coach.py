@@ -634,6 +634,15 @@ def build_plan(week_summary: dict) -> dict:
     def fmt_interval(rs: int, ws: int, n: int) -> str:
         return f"5–8 min warm-up wandelen/joggen, dan {rs//60}:{rs%60:02d} lopen / {ws//60}:{ws%60:02d} wandelen × {n}, 5–8 min uitwandelen."
 
+    # Base total time from latest run, so we don't jump too fast.
+    latest = _latest_run_with_timer(week_summary) or {}
+    base_total_s = int(latest.get("moving_time_s") or 0)
+    if base_total_s <= 0:
+        base_total_s = 30 * 60
+    # Conservative weekly increase in total time.
+    week1_total_s = min(base_total_s + 5 * 60, 38 * 60)
+    week2_total_s = min(week1_total_s + 5 * 60, 45 * 60)
+
     next_2_weeks = [
         {
             "week": "Week 1",
@@ -647,9 +656,9 @@ def build_plan(week_summary: dict) -> dict:
             "week": "Week 1",
             "session": "Training B",
             "when": "weekend",
-            "workout": "Easy duur op praattempo: 35–45 min totaal. Gebruik run/walk als nodig (bijv. 3:00/2:00) en vermijd ‘duwen’.",
-            "delta": "volume / soepelheid",
-            "why": "Extra aerobe prikkel zonder je krachttraining te slopen; bouwt conditie veilig op.",
+            "workout": f"Easy run/walk op praattempo: {week1_total_s//60}–{(week1_total_s//60)+5} min totaal. Gebruik {run_s//60}:{run_s%60:02d}/{walk_s//60}:{walk_s%60:02d} als ‘cruise control’ (niet aaneengesloten forceren).",
+            "delta": f"+~5 min totaal t.o.v. deze week (conservatief)",
+            "why": "We bouwen vooral totale tijd rustig op; jij gaf aan dat 15–20 min aaneengesloten nog zwaar is, dus we blijven bewust bij run/walk.",
         },
         {
             "week": "Week 2",
@@ -663,11 +672,25 @@ def build_plan(week_summary: dict) -> dict:
             "week": "Week 2",
             "session": "Training B",
             "when": "weekend",
-            "workout": "Easy duur op praattempo: 40–50 min totaal. Eindig met 4× 20s ‘vlotte pas’ (niet sprinten) als je je fris voelt.",
-            "delta": "+5 min (als herstel goed is)",
-            "why": "Langzaam duurvolume omhoog; kleine prikkel voor loopeconomie zonder hoge hartslag.",
+            "workout": f"Easy run/walk op praattempo: {week2_total_s//60}–{(week2_total_s//60)+5} min totaal. Optioneel: eindig met 4× 20s ‘vlotte pas’ (geen sprint) alleen als je fris bent.",
+            "delta": "+~5 min totaal (alleen als herstel goed is)",
+            "why": "Zelfde opbouwprincipe: tijd omhoog zonder ‘duwen’; korte vlotte passen helpen loopeconomie zonder hoge hartslag.",
         },
     ]
+
+    # Optional third session when recovery is good.
+    if coach.get("verdict") in {"stabiel → kleine progressie", "oké → nog 1 week vasthouden"}:
+        next_2_weeks.insert(
+            2,
+            {
+                "week": "Week 1",
+                "session": "Training C (optioneel)",
+                "when": "midweek (alleen als je benen fris zijn)",
+                "workout": "20–25 min heel rustig (wandelen/joggen mix). Stop als je ‘duwt’ of pijntjes voelt.",
+                "delta": "extra prikkel (laag risico)",
+                "why": "Als je herstel goed is, helpt een korte extra sessie je basisconditie zonder veel belasting.",
+            },
+        )
 
     # Roadmap: very compact, week blocks towards race date.
     race = week_summary.get("race_countdown") or {}
@@ -1297,11 +1320,11 @@ def send_email(subject: str, body: str, week_summary: dict) -> None:
     images: list[tuple[str, bytes]] = []
     for rd in (week_summary.get("runs_detailed") or [])[:3]:
         rid = rd.get("id")
-        series = rd.get("series")
-        if not rid or not series:
+        if not rid:
             continue
-        pace_png = _plot_series_png(series, kind="pace")
-        hr_png = _plot_series_png(series, kind="hr")
+        series = rd.get("series")
+        pace_png = _plot_series_png(series, kind="pace") if series else None
+        hr_png = _plot_series_png(series, kind="hr") if series else None
         interval_png = _plot_intervals_png(rd.get("timer_blocks") or rd.get("blocks") or [], title="Run/Walk timeline")
         if pace_png:
             cid = f"run{rid}-pace"
@@ -1353,11 +1376,11 @@ def write_preview(subject: str, body: str, week_summary: dict, *, out_dir: str =
     images: list[tuple[str, bytes]] = []
     for rd in runs_detailed[:3]:
         rid = rd.get("id")
-        series = rd.get("series")
-        if not rid or not series:
+        if not rid:
             continue
-        pace_png = _plot_series_png(series, kind="pace")
-        hr_png = _plot_series_png(series, kind="hr")
+        series = rd.get("series")
+        pace_png = _plot_series_png(series, kind="pace") if series else None
+        hr_png = _plot_series_png(series, kind="hr") if series else None
         interval_png = _plot_intervals_png(rd.get("timer_blocks") or rd.get("blocks") or [], title="Run/Walk timeline")
         if pace_png:
             images.append((f"run{rid}-pace.png", pace_png))
