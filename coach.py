@@ -677,6 +677,7 @@ def build_plan(week_summary: dict) -> dict:
             start_date = today
     else:
         start_date = today  # week 1 anchored to "now" unless configured
+    # week_idx is the "current" plan week that contains today (Week 1 starts at start_date).
     week_idx = max(1, int(((today - start_date).days // 7) + 1))
 
     def week_rows(w: int) -> list[dict]:
@@ -698,9 +699,10 @@ def build_plan(week_summary: dict) -> dict:
             },
         ]
 
-    next_w1 = week_idx
-    next_w2 = min(16, week_idx + 1)
-    prev_w = max(1, week_idx - 1)
+    # This email is a week-end coach mail: we show the *upcoming* 2 weeks.
+    next_w1 = min(16, week_idx + 1)
+    next_w2 = min(16, next_w1 + 1)
+    prev_w = week_idx
 
     rows = week_rows(next_w1) + (week_rows(next_w2) if next_w2 != next_w1 else [])
     prev = plan_weeks.get(prev_w) or {}
