@@ -1,0 +1,24 @@
+{
+  "plan_name": "Singelloop Utrecht — 10km < 60 (16 weken)",
+  "start_date": null,
+  "timezone": "Europe/Amsterdam",
+  "weeks": [
+    { "week": 1, "t1": "3 min lopen / 2 min wandelen × 6", "t2": "20 min rustig hardlopen" },
+    { "week": 2, "t1": "3 min / 2 min × 7", "t2": "25 min rustig" },
+    { "week": 3, "t1": "4 min / 2 min × 5", "t2": "28 min rustig" },
+    { "week": 4, "t1": "5 min / 2 min × 4", "t2": "30 min rustig" },
+    { "week": 5, "t1": "8 min / 2 min × 3", "t2": "32 min rustig" },
+    { "week": 6, "t1": "10 min / 2 min × 3", "t2": "35 min rustig" },
+    { "week": 7, "t1": "12 min / 2 min × 2 + 8 min lopen", "t2": "38 min rustig" },
+    { "week": 8, "t1": "20 min aaneengesloten + 5 min extra", "t2": "40 min rustig" },
+    { "week": 9, "t1": "3 × 8 min op tempo (±6:15–6:20/km)", "t2": "45 min rustig" },
+    { "week": 10, "t1": "2 × 12 min op tempo", "t2": "50 min rustig" },
+    { "week": 11, "t1": "25 min steady (niet maximaal)", "t2": "55 min rustig" },
+    { "week": 12, "t1": "30 min aaneengesloten", "t2": "60 min rustig" },
+    { "week": 13, "t1": "3 × 10 min op 6:00–6:10/km", "t2": "60 min rustig" },
+    { "week": 14, "t1": "2 × 15 min op 6:00/km", "t2": "65 min rustig" },
+    { "week": 15, "t1": "25 min op 6:00/km", "t2": "45 min rustig" },
+    { "week": 16, "t1": "20 min relaxed", "t2": "RACE (10 km)" }
+  ]
+}
+
