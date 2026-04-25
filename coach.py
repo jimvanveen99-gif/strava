@@ -715,6 +715,19 @@ def build_plan(week_summary: dict) -> dict:
     delta_label = "\n".join(delta_lines) if delta_lines else "Geen verandering t.o.v. vorige week."
 
     coach = coaching_from_timer_blocks(week_summary)
+    # Align "next_step" with the fixed plan so it never conflicts with the schedule.
+    planned = plan_weeks.get(next_w1) or {}
+    planned_t1 = planned.get("t1")
+    planned_t2 = planned.get("t2")
+    if planned_t1 or planned_t2:
+        coach_next: list[str] = []
+        if planned_t1:
+            coach_next.append(f"Volgende training (Week {next_w1} – Training 1): {planned_t1}")
+        if planned_t2:
+            coach_next.append(f"Daarna (Week {next_w1} – Training 2): {planned_t2}")
+        if "rustiger" in str(coach.get("verdict") or "").lower() and next_w1 > 1:
+            coach_next.append("Als dit te zwaar voelt of je HR blijft hoog: herhaal Week 1 nog één week (liever veilig dan forceren).")
+        coach["next_step"] = "\n".join(coach_next)
     return {
         "plan_name": plan_doc.get("plan_name") or "training_plan.json",
         "coach": coach,
