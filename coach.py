@@ -880,7 +880,19 @@ def should_send_now(now_utc: datetime) -> bool:
         return True
     tz = ZoneInfo("Europe/Amsterdam")
     local = now_utc.astimezone(tz)
-    return local.weekday() == 6 and local.hour == 22  # Sunday=6
+    if local.weekday() != 6:  # Sunday=6
+        return False
+
+    # GitHub scheduled workflows can drift by minutes (or even run on the next cron slot).
+    # Accept a small window around 22:00 local so we don't miss the weekly send.
+    # Window: 21:50–23:10 Europe/Amsterdam.
+    if local.hour == 22:
+        return True
+    if local.hour == 21 and local.minute >= 50:
+        return True
+    if local.hour == 23 and local.minute <= 10:
+        return True
+    return False
 
 
 def build_week_summary(runs: list[Activity]) -> dict:
